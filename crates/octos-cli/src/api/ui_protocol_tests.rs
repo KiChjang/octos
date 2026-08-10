@@ -21,6 +21,120 @@ fn should_normalize_safe_tool_context_at_protocol_boundary() {
     assert_eq!(normalize_tool_context(Some(&"a".repeat(65))), None);
 }
 
+#[test]
+fn should_make_voice_admission_single_use_and_idempotent_for_same_turn() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-1".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    let retried_issue = store.issue(
+        "request-1".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "第二次 ASR 的漂移结果".to_owned(),
+    );
+    assert_eq!(retried_issue.admission_id, admission.admission_id);
+    assert_eq!(retried_issue.transcript, "你好");
+
+    let claimed = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("first commit should claim the admission");
+    assert_eq!(claimed, VoiceAdmissionClaim::Start("你好".to_owned()));
+
+    store.finalize(&admission.admission_id, &turn_id);
+    let retried = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("same-turn retry should be idempotent");
+    assert_eq!(retried, VoiceAdmissionClaim::AlreadyCommitted);
+}
+
+#[test]
+fn should_reject_voice_admission_when_scope_or_audio_changes() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-2".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    assert!(
+        store
+            .claim(
+                &admission.admission_id,
+                &SessionKey("other:api:voice".to_owned()),
+                &turn_id,
+                &["up/audio.wav".to_owned()],
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .claim(
+                &admission.admission_id,
+                &session_id,
+                &turn_id,
+                &["up/other.wav".to_owned()],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn should_release_voice_admission_claim_after_start_failure() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-3".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    let first = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("claim");
+    assert!(matches!(first, VoiceAdmissionClaim::Start(_)));
+    store.release(&admission.admission_id, &turn_id);
+    let retry = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("released claim should be reusable");
+    assert!(matches!(retry, VoiceAdmissionClaim::Start(_)));
+}
+
 /// The §6 "Envelope Model" catalog in
 /// `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` is a hand-maintained
 /// mirror of the advertised method constants and has historically drifted
@@ -2168,6 +2282,29 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_TURN_STEER => json!({
             "session_id": session_id,
             "input": [{ "kind": "text", "text": "steer probe" }],
+        }),
+        APPUI_METHOD_VOICE_ADMIT => json!({
+            "session_id": session_id,
+            "request_id": "probe-voice-admit",
+            "turn_id": turn_id,
+            "media": [{
+                "path": "up/probe-voice.wav",
+                "mime": "audio/wav",
+                "size_bytes": 0,
+            }],
+        }),
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION => json!({
+            "admission_id": "missing-probe-admission",
+            "turn": {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "voice commit probe" }],
+                "media": [{
+                    "path": "up/probe-voice.wav",
+                    "mime": "audio/wav",
+                    "size_bytes": 0,
+                }],
+            },
         }),
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
@@ -21366,24 +21503,26 @@ fn voice_combine_falls_back_to_transcript_for_pure_voice_turn() {
 }
 
 #[test]
-fn voice_no_speech_short_circuit_ignores_non_audio_media() {
-    // #1555 review finding 1: `asr_media` holds ALL media paths, so a
-    // text+image turn (no audio at all) must NOT take the no-speech early
-    // return — it previously completed the turn without running the agent.
-    // (had_audio_media, had_non_audio_media, had_audio_input, prompt_is_empty)
-    assert!(!should_short_circuit_no_speech(false, true, false, false));
-    assert!(!should_short_circuit_no_speech(false, true, false, true));
-    // No media at all → nothing voice-related to short-circuit on.
-    assert!(!should_short_circuit_no_speech(false, false, false, true));
-    // Silent audio + typed prompt → proceed as a plain text turn.
-    assert!(!should_short_circuit_no_speech(true, false, false, false));
-    // Silent audio + image/file → proceed; the agent still has real input.
-    assert!(!should_short_circuit_no_speech(true, true, false, true));
-    // Audio that produced a transcript → never short-circuit.
-    assert!(!should_short_circuit_no_speech(true, false, true, true));
-    // Only a genuinely empty voice turn (silent audio, nothing else)
-    // takes the friendly "no speech detected" path.
-    assert!(should_short_circuit_no_speech(true, false, false, true));
+fn should_short_circuit_no_speech_without_considering_sibling_inputs() {
+    // Prompt/image state is deliberately absent from this API: once a request
+    // carries audio and ASR rejects all of it, sibling inputs cannot bypass
+    // the voice admission gate.
+    assert!(should_short_circuit_no_speech(
+        true,
+        VoiceAsrStatus::NoSpeech
+    ));
+    assert!(!should_short_circuit_no_speech(
+        true,
+        VoiceAsrStatus::Speech
+    ));
+    assert!(!should_short_circuit_no_speech(
+        true,
+        VoiceAsrStatus::Failed
+    ));
+    assert!(!should_short_circuit_no_speech(
+        false,
+        VoiceAsrStatus::NoAudio
+    ));
 }
 
 // ========================================================================
