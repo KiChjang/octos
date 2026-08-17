@@ -208,6 +208,14 @@ pub const UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtim
 /// Optional M15 feature flag for recurring loop runtime controls.
 pub const UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
 
+/// Optional feature flag for zero-token monitor runtime controls (#1977).
+/// A monitor is a sandboxed background probe process whose filtered stdout
+/// lines wake the master via external continuations — the model runs only
+/// when an event line appears (vs `/loop`, which burns a full master turn
+/// every tick). Gates `monitor/create|list|pause|resume|delete` and the
+/// `monitor/fired|updated|expired` notifications.
+pub const UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1: &str = "coding.monitor_runtime.v1";
+
 /// Optional M15 feature flag for backend-owned product review workflows.
 pub const UI_PROTOCOL_FEATURE_REVIEW_START_V1: &str = "review.start.v1";
 
@@ -249,6 +257,16 @@ pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
 /// turn keeps emitting whole-file `file/attached` audio.
 pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 
+/// #2019 — feature flag for the HUMAN sink over background events that
+/// otherwise only wake the model. Monitor event lines (#1977) and claimed
+/// fleet outbox events already exist, are already durable, and already have
+/// producers — but their sole consumer is the model, so a monitor that fires
+/// forty times during a loop is invisible to the user. When negotiated, the
+/// server additionally pushes `background/activity` notifications carrying the
+/// origin-attributed event text. Purely additive: the model is woken exactly
+/// as before, and this stream is NEVER fed back into model context.
+pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_activity.v1";
+
 /// Feature flag for the model-authored plan/todo checklist. When negotiated,
 /// the server pushes `plan/updated` notifications carrying the agent's current
 /// ordered checklist (the `update_plan` tool's live state), and replays the
@@ -288,6 +306,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
@@ -295,6 +314,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 
@@ -353,6 +373,11 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::LOOP_PAUSE
         | methods::LOOP_RESUME
         | methods::LOOP_FIRE_NOW => Some(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
+        methods::MONITOR_CREATE
+        | methods::MONITOR_LIST
+        | methods::MONITOR_PAUSE
+        | methods::MONITOR_RESUME
+        | methods::MONITOR_DELETE => Some(UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1),
         methods::REVIEW_START => Some(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
         methods::USER_QUESTION_RESPOND => Some(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
         methods::SMART_HOME_STATUS_GET
@@ -550,6 +575,11 @@ pub mod autonomy_error_kinds {
     pub const LOOP_BUSY: &str = "loop_busy";
     pub const LOOP_SLASH_DENIED: &str = "loop_slash_denied";
     pub const LOOP_POLICY_DENIED: &str = "loop_policy_denied";
+    // #1977 monitor runtime typed errors, mirroring the loop_* family.
+    pub const MONITOR_NOT_FOUND: &str = "monitor_not_found";
+    pub const MONITOR_INVALID_SPEC: &str = "monitor_invalid_spec";
+    pub const MONITOR_POLICY_DENIED: &str = "monitor_policy_denied";
+    pub const MONITOR_FLOODED: &str = "monitor_flooded";
     pub const AUTONOMY_QUOTA_EXCEEDED: &str = "autonomy_quota_exceeded";
 }
 
@@ -1044,6 +1074,13 @@ pub mod methods {
     pub const LOOP_RESUME: &str = "loop/resume";
     pub const LOOP_FIRE_NOW: &str = "loop/fire_now";
 
+    /// #1977 zero-token monitor runtime surface, mirroring `loop/*`.
+    pub const MONITOR_CREATE: &str = "monitor/create";
+    pub const MONITOR_LIST: &str = "monitor/list";
+    pub const MONITOR_PAUSE: &str = "monitor/pause";
+    pub const MONITOR_RESUME: &str = "monitor/resume";
+    pub const MONITOR_DELETE: &str = "monitor/delete";
+
     /// Product-level automated code review workflow.
     ///
     /// This is not a generic child-agent control API. The backend owns the
@@ -1224,6 +1261,10 @@ pub mod methods {
     pub const LOOP_UPDATED: &str = "loop/updated";
     pub const LOOP_FIRED: &str = "loop/fired";
     pub const LOOP_COMPLETED: &str = "loop/completed";
+    /// #1977 monitor runtime notifications, mirroring `loop/*`.
+    pub const MONITOR_FIRED: &str = "monitor/fired";
+    pub const MONITOR_UPDATED: &str = "monitor/updated";
+    pub const MONITOR_EXPIRED: &str = "monitor/expired";
     /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
     pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
     pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
@@ -1231,6 +1272,12 @@ pub mod methods {
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
     /// Session-level whole-job orchestration status notification.
     pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
+    /// #2019 `background/activity` — the HUMAN sink over background events
+    /// that today only wake the model (monitor event lines, claimed fleet
+    /// outbox events). Origin-attributed, durable, capped, and NEVER routed
+    /// back into model context. Gated on
+    /// [`super::UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1`].
+    pub const BACKGROUND_ACTIVITY: &str = "background/activity";
     /// #1801 v3 `peer/staged` — agent-initiated peer staging. The model's
     /// `peer_handoff` tool staged a sovereign peer session server-side
     /// (durable brief + optional fenced worktree); sessions are
@@ -1311,6 +1358,11 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::LOOP_PAUSE,
     methods::LOOP_RESUME,
     methods::LOOP_FIRE_NOW,
+    methods::MONITOR_CREATE,
+    methods::MONITOR_LIST,
+    methods::MONITOR_PAUSE,
+    methods::MONITOR_RESUME,
+    methods::MONITOR_DELETE,
     methods::REVIEW_START,
     methods::SESSION_LIST,
     methods::SESSION_SNAPSHOT,
@@ -1382,11 +1434,15 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::LOOP_UPDATED,
     methods::LOOP_FIRED,
     methods::LOOP_COMPLETED,
+    methods::MONITOR_FIRED,
+    methods::MONITOR_UPDATED,
+    methods::MONITOR_EXPIRED,
     methods::CONTEXT_COMPACTION_COMPLETED,
     methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
     methods::PEER_STAGED,
     methods::PEER_CLOSED,
+    methods::BACKGROUND_ACTIVITY,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -1428,6 +1484,11 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::LOOP_PAUSE,
     methods::LOOP_RESUME,
     methods::LOOP_FIRE_NOW,
+    methods::MONITOR_CREATE,
+    methods::MONITOR_LIST,
+    methods::MONITOR_PAUSE,
+    methods::MONITOR_RESUME,
+    methods::MONITOR_DELETE,
     methods::REVIEW_START,
     methods::SESSION_LIST,
     methods::SESSION_SNAPSHOT,
@@ -1529,6 +1590,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
             UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
             UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+            UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
@@ -1670,6 +1732,7 @@ fn is_autonomy_optional_feature(feature: &str) -> bool {
         UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1
             | UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1
             | UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1
+            | UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1
     )
 }
 
@@ -5898,6 +5961,14 @@ pub struct SessionGoalUpdatedEvent {
     pub profile_id: Option<String>,
     pub goal: UiGoalRecord,
     pub transition_actor: String,
+    /// #1959 — monotonic generation stamped by the backend on every goal
+    /// event. A client MUST drop a `SessionGoalUpdated` whose `generation` is
+    /// not greater than the last goal event it applied for this session, so a
+    /// stale update can't overtake a `SessionGoalCleared` and resurrect the
+    /// chip. `0` (the serde default) means an older backend that doesn't stamp;
+    /// clients treat `0` as "always apply" for backward compatibility.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5910,6 +5981,11 @@ pub struct SessionGoalClearedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<UiGoalRecord>,
     pub transition_actor: String,
+    /// #1959 — see [`SessionGoalUpdatedEvent::generation`]. A clear carries a
+    /// generation strictly greater than any update it should supersede, so the
+    /// client keeps the clear and drops a later-arriving stale update.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// M15 recurring loop snapshot.
@@ -6002,6 +6078,94 @@ pub struct LoopCompletedEvent {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// #1977 — one monitor's client-visible state, mirroring [`UiLoopRecord`].
+/// `argv` is the sandboxed probe command; `mode` is `"poll"` or `"stream"`;
+/// `status` is `active` / `paused` / `expired` / `deleted` with an optional
+/// `pause_reason` (e.g. `"flooded"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiMonitorRecord {
+    pub monitor_id: String,
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub name: String,
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_regex: Option<String>,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
+    pub batch_ms: u32,
+    pub max_events_per_hour: u32,
+    pub persistent: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at_ms: Option<i64>,
+    pub fires_used: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// #1977 — monitor metadata changed (create / pause / resume / delete),
+/// mirroring [`LoopUpdatedEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_id: Option<String>,
+    #[serde(rename = "monitor")]
+    pub monitor_state: UiMonitorRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+}
+
+/// #1977 — a monitor's filtered event batch queued a master wake,
+/// mirroring [`LoopFiredEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorFiredEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub monitor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Number of filtered lines in the batch that queued this wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_at_ms: Option<i64>,
+}
+
+/// #1977 — a non-persistent monitor reached its timeout (or its stream
+/// process exited) and expired, mirroring [`LoopCompletedEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorExpiredEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub monitor_id: String,
+    #[serde(default, rename = "monitor", skip_serializing_if = "Option::is_none")]
+    pub monitor_state: Option<UiMonitorRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// M16 active model-visible context state exposed through AppUI lifecycle
@@ -6349,6 +6513,59 @@ pub struct PeerClosedEvent {
     pub profile_id: String,
 }
 
+/// #2019 — one background event surfaced to the HUMAN.
+///
+/// Background events (a monitor's filtered stdout line, a claimed fleet outbox
+/// event) already exist and are already durable, but their only consumer is
+/// the model: the sole effect of an event is that the master gets woken, and
+/// whether any of it reaches the transcript depends on whether the model
+/// volunteers it. This is the second consumer — the user — so a monitor that
+/// fires forty times during a self-critic loop is visible rather than a silent
+/// session.
+///
+/// Contract:
+/// - `session_id` is **required** and is the routing key. Activity without one
+///   renders in whichever session happens to be focused (octos-tui#461, #466,
+///   #483) — the exact bug class this event must not re-ship.
+/// - `origin_kind` + `origin_id` (+ optional `origin_label`) attribute the
+///   line. An unattributed monitor/peer line reads as the master speaking.
+/// - The stream is CAPPED per origin. `dropped_count` reports events the cap
+///   suppressed and that this event accounts for; `suppressed` marks the
+///   explicit drop MARKER row (silent truncation reads as "nothing more
+///   happened").
+/// - Durable (ledger-appended) so a client disconnected mid-loop replays the
+///   stream instead of losing its middle.
+/// - This payload is NEVER routed back into model context. It exists so the
+///   human can see what the model was woken by; feeding it back would be a
+///   compaction/cost problem and would make the loop observe itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundActivityEvent {
+    /// REQUIRED routing key — the session whose master this event woke.
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Emitter class. Open registry; today `"monitor"` or `"fleet"`.
+    pub origin_kind: String,
+    /// Stable id of the emitter within its class (monitor id / fleet id).
+    pub origin_id: String,
+    /// Human label for the emitter (monitor name, peer slug, …). Clients fall
+    /// back to `origin_id` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_label: Option<String>,
+    /// The observed event text (one monitor line, or one fleet event summary).
+    pub text: String,
+    /// Wall-clock emission time, ms since the Unix epoch.
+    pub emitted_at_ms: i64,
+    /// Events this origin's cap suppressed, accounted for by THIS event.
+    /// `None`/`0` when nothing was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_count: Option<u64>,
+    /// `true` when this row IS the cap's visible drop marker rather than an
+    /// observed event line.
+    #[serde(default)]
+    pub suppressed: bool,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -6427,6 +6644,12 @@ pub enum UiNotification {
     LoopFired(LoopFiredEvent),
     /// UPCR-2026-021 M15: loop iteration reached a terminal result.
     LoopCompleted(LoopCompletedEvent),
+    /// #1977: monitor metadata changed (create / pause / resume / delete).
+    MonitorUpdated(MonitorUpdatedEvent),
+    /// #1977: a monitor's filtered event batch queued a master wake.
+    MonitorFired(MonitorFiredEvent),
+    /// #1977: a non-persistent monitor expired.
+    MonitorExpired(MonitorExpiredEvent),
     /// M16: compact-context lifecycle event.
     ContextCompactionCompleted(ContextCompactionCompletedEvent),
     ContextCompactionStarted(ContextCompactionStartedEvent),
@@ -6444,6 +6667,9 @@ pub enum UiNotification {
     /// The model's `peer_close` tool tore down a staged peer session; the
     /// client closes the peer pane it opened. See [`PeerClosedEvent`].
     PeerClosed(PeerClosedEvent),
+    /// #2019: a background event that woke the model, surfaced to the HUMAN.
+    /// See [`BackgroundActivityEvent`].
+    BackgroundActivity(BackgroundActivityEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -6513,12 +6739,16 @@ impl UiNotification {
             Self::LoopUpdated(_) => methods::LOOP_UPDATED,
             Self::LoopFired(_) => methods::LOOP_FIRED,
             Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
+            Self::MonitorUpdated(_) => methods::MONITOR_UPDATED,
+            Self::MonitorFired(_) => methods::MONITOR_FIRED,
+            Self::MonitorExpired(_) => methods::MONITOR_EXPIRED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
             Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::PeerClosed(_) => methods::PEER_CLOSED,
+            Self::BackgroundActivity(_) => methods::BACKGROUND_ACTIVITY,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
@@ -6566,12 +6796,16 @@ impl UiNotification {
             Self::LoopUpdated(event) => &event.session_id,
             Self::LoopFired(event) => &event.session_id,
             Self::LoopCompleted(event) => &event.session_id,
+            Self::MonitorUpdated(event) => &event.session_id,
+            Self::MonitorFired(event) => &event.session_id,
+            Self::MonitorExpired(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
             Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::PeerStaged(event) => &event.session_id,
             Self::PeerClosed(event) => &event.session_id,
+            Self::BackgroundActivity(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
@@ -6724,6 +6958,9 @@ impl UiNotification {
             Self::LoopUpdated(params) => serde_json::to_value(params),
             Self::LoopFired(params) => serde_json::to_value(params),
             Self::LoopCompleted(params) => serde_json::to_value(params),
+            Self::MonitorUpdated(params) => serde_json::to_value(params),
+            Self::MonitorFired(params) => serde_json::to_value(params),
+            Self::MonitorExpired(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
@@ -6734,6 +6971,9 @@ impl UiNotification {
             // and routing keys off `session_id` (the originating session).
             Self::PeerStaged(params) => serde_json::to_value(params),
             Self::PeerClosed(params) => serde_json::to_value(params),
+            // #2019: routing keys off `session_id` like every other
+            // session-scoped notification; the origin fields are payload.
+            Self::BackgroundActivity(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
             // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
             // with the routing keys `session_id` (the bare base key) +
@@ -6868,6 +7108,9 @@ impl UiNotification {
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
             methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::MONITOR_UPDATED => Ok(Self::MonitorUpdated(decode_params(method, params)?)),
+            methods::MONITOR_FIRED => Ok(Self::MonitorFired(decode_params(method, params)?)),
+            methods::MONITOR_EXPIRED => Ok(Self::MonitorExpired(decode_params(method, params)?)),
             methods::CONTEXT_COMPACTION_STARTED => Ok(Self::ContextCompactionStarted(
                 decode_params(method, params)?,
             )),
@@ -6882,6 +7125,9 @@ impl UiNotification {
             }
             methods::PEER_STAGED => Ok(Self::PeerStaged(decode_params(method, params)?)),
             methods::PEER_CLOSED => Ok(Self::PeerClosed(decode_params(method, params)?)),
+            methods::BACKGROUND_ACTIVITY => {
+                Ok(Self::BackgroundActivity(decode_params(method, params)?))
+            }
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
             // the FLATTENED wire frame — bare Envelope keys plus the
             // routing keys `session_id` + `topic`. Backward-compatible:

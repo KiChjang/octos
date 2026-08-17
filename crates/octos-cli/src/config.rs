@@ -146,6 +146,12 @@ pub struct Config {
 
     /// Sub-providers available for subagent spawning via the spawn tool.
     /// Each entry registers a provider under a short key that the LLM can reference.
+    ///
+    /// #1935 — the key `goal_verifier` is RESERVED: when present, that lane
+    /// becomes the INDEPENDENT goal-completion verifier model (see
+    /// `crate::runtime::profile::build_goal_verifier_provider`). Without it,
+    /// goal completion is verified on the grading session's own provider —
+    /// the pre-#1935 behavior, kept as the back-compat default.
     #[serde(default)]
     pub sub_providers: Vec<SubProviderConfig>,
 
@@ -2323,6 +2329,20 @@ mod tests {
         }"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(gw.reasoning_effort, Some(octos_llm::ReasoningEffort::High));
+    }
+
+    #[test]
+    fn should_parse_none_when_gateway_reasoning_is_disabled() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "reasoning_effort": "none"
+        }"#;
+        let gw: GatewayConfig =
+            serde_json::from_str(json).expect("none should disable gateway reasoning");
+        assert_eq!(
+            serde_json::to_value(gw.reasoning_effort.unwrap()).unwrap(),
+            serde_json::json!("none")
+        );
     }
 
     #[test]

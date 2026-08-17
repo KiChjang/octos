@@ -614,7 +614,22 @@ impl ServeCommand {
             }
         };
 
-        if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
+        // #1973 fix A — load the persisted cwd-scope registry BEFORE the
+        // supervisor store restores goals, so a goal stored under a scoped key
+        // (`<wire>\0~cwd-<scope>`) resolves — and its restored continuation is
+        // dispatchable — immediately at boot instead of only after a client
+        // reopens the session. Failure is non-fatal: the registry starts empty
+        // (the pre-sidecar behavior) and repopulates on session/open.
+        if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+            .configure_goal_scopes_sidecar(data_dir.join("goal-scopes.json"))
+        {
+            tracing::warn!(
+                %error,
+                "failed to load goal-scopes sidecar; restored cwd-scoped goals stay \
+                 invisible until their session reopens"
+            );
+        }
+        if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
             .configure_supervisor_store(data_dir.join("supervisor"))
         {
             tracing::warn!(
@@ -627,7 +642,7 @@ impl ServeCommand {
             // firing model turns on a single-operator box. Park them paused;
             // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
             for (loop_id, session_id) in
-                crate::api::agent_orchestrator::default_agent_orchestrator()
+                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                     .pause_restored_loops_for_solo_boot()
             {
                 tracing::info!(
@@ -641,9 +656,22 @@ impl ServeCommand {
             // for. Park paused; `/goal resume` re-arms,
             // OCTOS_SOLO_RESUME_GOALS=1 opts out.
             if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
+                // #1973 fix C — resolve each parked goal's PROFILE data dir so
+                // the park also flips the durable per-goal SQLite ledger row to
+                // `paused` (it used to keep saying `active` forever). A
+                // short-lived registry handle: the long-lived `profile_store`
+                // is built later in boot, and opening the store twice is just
+                // idempotent path math + create_dir_all.
+                let park_profile_registry =
+                    crate::profiles::ProfileStore::open(&state_home, &data_dir).ok();
+                let park_profile_data_dir = |profile_id: &str| -> Option<PathBuf> {
+                    let registry = park_profile_registry.as_ref()?;
+                    let profile = registry.get(profile_id).ok().flatten()?;
+                    Some(registry.resolve_data_dir(&profile))
+                };
                 for (goal_id, session_id) in
-                    crate::api::agent_orchestrator::default_agent_orchestrator()
-                        .pause_restored_goals_for_solo_boot()
+                    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                        .pause_restored_goals_for_solo_boot_with_ledger_sync(&park_profile_data_dir)
                 {
                     tracing::info!(
                         goal_id = %goal_id,
@@ -674,7 +702,7 @@ impl ServeCommand {
         let mut fleet_reconciled = false;
         match octos_fleet::FleetKernelStore::open(data_dir.join("fleet-kernel")).await {
             Ok(fleet_store) => {
-                crate::api::agent_orchestrator::default_agent_orchestrator()
+                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                     .set_fleet_store(fleet_store.clone());
                 // #1857 PR 5a — BOOT RECOVERY: interrupt any attempt still
                 // holding a stale (prior-epoch) lease, release its budget
@@ -701,7 +729,7 @@ impl ServeCommand {
                          dispatch). Stale leases still expire on their TTL."
                     );
                 }
-                crate::api::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
+                crate::autonomy::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
                 tracing::info!("fleet-kernel outbox consumer started");
             }
             Err(error) => {
@@ -905,7 +933,7 @@ impl ServeCommand {
         //
         // Fix (HIGH 2): gated on `fleet_reconciled` — a store that failed its
         // boot reconcile must not accept new dispatch, so no pool is installed.
-        if let Some(fleet_store) = crate::api::agent_orchestrator::default_agent_orchestrator()
+        if let Some(fleet_store) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
             .fleet_store()
             .filter(|_| fleet_reconciled)
         {
@@ -967,16 +995,56 @@ impl ServeCommand {
                                 let mut cfg = sandbox_cfg.clone();
                                 cfg.allow_network = grant.allow_network;
                                 cfg.repo_git_write = grant.repo_git_dir;
+                                // #1976 — fold the per-path SHELL write fence
+                                // onto the base config. macOS enforces it as
+                                // SBPL regex rules; bwrap/docker degrade the
+                                // workspace to read-only for the shell (warned
+                                // in create_sandbox). Deny-wins with the file
+                                // tools' own fence.
+                                cfg.write_allow_globs = grant.write_allow_globs;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
                                     octos_agent::sandbox::create_sandbox(&cfg),
                                 )
                             },
                         );
-                        let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
-                            rt.llm.clone(),
-                            rt.memory.clone(),
-                            sandbox_factory,
-                        ));
+                        // #1976 — the `[denied]` write-grant violation sink:
+                        // a fenced worker's refused write is returned to the
+                        // model by the tool AND recorded here as a durable
+                        // `[denied]`-class finding on the offending task's
+                        // goal ledger. Detached to the blocking pool (sqlite
+                        // I/O) so a rare violation never stalls the worker's
+                        // async turn. Best-effort — the tool refusal already
+                        // bounded the write.
+                        let denial_data_dir = rt.data_dir.clone();
+                        let denial_profile_id = rt.profile_id.clone();
+                        let violation_sink: octos_agent::tools::write_grant::WriteGrantViolationSink =
+                            Arc::new(move |v: octos_agent::tools::write_grant::WriteGrantViolation| {
+                                let data_dir = denial_data_dir.clone();
+                                let profile_id = denial_profile_id.clone();
+                                let record = move || {
+                                    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                                        .record_fleet_write_grant_denial(
+                                            &data_dir,
+                                            &profile_id,
+                                            &v.workspace,
+                                            &v.detail,
+                                        );
+                                };
+                                match tokio::runtime::Handle::try_current() {
+                                    Ok(handle) => {
+                                        handle.spawn_blocking(record);
+                                    }
+                                    Err(_) => record(),
+                                }
+                            });
+                        let factory = Arc::new(
+                            octos_fleet_worker::AgentFactory::new(
+                                rt.llm.clone(),
+                                rt.memory.clone(),
+                                sandbox_factory,
+                            )
+                            .with_violation_sink(violation_sink),
+                        );
                         let cfg = octos_fleet_worker::PoolConfig {
                             global_concurrency: FLEET_POOL_GLOBAL_CONCURRENCY,
                             per_fleet_concurrency: FLEET_POOL_PER_FLEET_CONCURRENCY,
@@ -1004,8 +1072,16 @@ impl ServeCommand {
                             cfg,
                             Arc::new(|| chrono::Utc::now().timestamp_millis().max(0) as u64),
                         );
-                        crate::api::agent_orchestrator::default_agent_orchestrator()
+                        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                             .set_fleet_pool(Arc::new(pool));
+                        // #1865/#1964 — the keeper profile's data dir, installed
+                        // beside the pool it belongs to: the eager fleet settle
+                        // monitor syncs fleet-driven goal terminals into
+                        // `<data_dir>/goal-ledgers/` (the SAME dir the profile's
+                        // goal_get/goal_update/goal_deny tools carry via
+                        // `.with_data_dir` in runtime/profile.rs).
+                        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                            .set_fleet_ledger_data_dir(rt.data_dir.clone());
                         tracing::info!(
                             keeper_profile = %rt.profile_id,
                             "fleet worker pool installed (goal keeper dispatch enabled)"
@@ -1031,7 +1107,8 @@ impl ServeCommand {
         // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
         // nothing to dispatch onto). Re-fetch the store here: the local binding
         // was moved into the outbox consumer / worker pool above.
-        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_orchestrator =
+            crate::autonomy::agent_orchestrator::default_agent_orchestrator();
         let boot_resume_store =
             if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
                 boot_resume_orchestrator.fleet_store()
@@ -1040,7 +1117,7 @@ impl ServeCommand {
             };
         if let Some(store) = boot_resume_store {
             let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+            match crate::autonomy::fleet_wake::enqueue_fleet_boot_resume_wakes(
                 &store,
                 boot_resume_orchestrator,
                 now_ms,
@@ -1396,8 +1473,35 @@ impl ServeCommand {
             preview_sweeper: Some(preview_sweeper),
         });
 
+        // mini5 soak gap #1 / #1973 fix E: drain queued master continuations
+        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
+        // even when NO ws/stdio client is connected. The per-connection
+        // `appui_continuation_tick` only runs inside a live handler loop, so a
+        // sub-agent finishing while the TUI is disconnected (or a continuation
+        // re-loaded after a serve restart) would otherwise sit undrained until
+        // a client reconnects. Shares the process-global active-turns registry
+        // with the per-connection ticks, so there is no double-run.
+        //
+        // #1973 fix E — spawned BEFORE the stdio early-return below, so
+        // `serve --stdio` (headless stdio deployments) gets the same
+        // continuation safety net and escalation-timeout sweep the HTTP serve
+        // always had. This is a deliberate behavior change for stdio serves:
+        // restored goal/loop continuations now drain even while the stdio
+        // client is idle or detached, instead of waiting for connection ticks.
+        // Everything the drain needs (the full AppState) is constructed above.
+        crate::api::ui_protocol_transport::spawn_global_master_continuation_drain(state.clone());
+
+        // #2019 — install the HUMAN sink over background events that today
+        // only wake the model (monitor event lines, claimed fleet outbox
+        // events). Spawned here, next to (and before) the global drain, so
+        // both `serve --stdio` and the HTTP serve get it: the producers are
+        // the connection-independent watcher tasks and the outbox consumer,
+        // so the sink must not be per-connection either. Purely additive —
+        // it changes nothing about how or when the model is woken.
+        crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
+
         if self.stdio {
-            crate::api::ui_protocol::stdio_connection(state).await?;
+            crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");
             let _ = process_manager.stop_all().await;
             return Ok(());
@@ -1630,16 +1734,9 @@ impl ServeCommand {
             }
         }
 
-        // mini5 soak gap #1: drain queued master continuations
-        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
-        // even when NO ws/stdio client is connected. The per-connection
-        // `appui_continuation_tick` only runs inside a live handler loop, so a
-        // sub-agent finishing while the TUI is disconnected (or a continuation
-        // re-loaded after a serve restart) would otherwise sit undrained until
-        // a client reconnects. Shares the process-global active-turns registry
-        // with the per-connection ticks, so there is no double-run.
-        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
-
+        // (#1973 fix E — the global master-continuation drain used to be
+        // spawned HERE, after the stdio early-return; it now spawns right
+        // before that branch so stdio serves share the safety net.)
         let app = build_router(state);
         let listener =
             http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");
@@ -1649,14 +1746,16 @@ impl ServeCommand {
             .to_string();
 
         tracing::info!(address = %addr, "octos API server starting");
-        tracing::info!(dashboard = %format!("http://{}/admin/", addr), "dashboard available");
+        tracing::info!(app = %format!("http://{}/app/", addr), "web app available");
+        tracing::info!(dashboard = %format!("http://{}/admin/", addr), "admin dashboard available");
         if enabled_count > 0 {
             tracing::info!(count = enabled_count, "gateway profiles auto-started");
         }
 
         println!("{}", "octos API server".cyan().bold());
         println!("{}: http://{}", "Listening".green(), addr);
-        println!("{}: http://{}/admin/", "Dashboard".green(), addr);
+        println!("{}: http://{}/app/", "App".green(), addr);
+        println!("{}: http://{}/admin/", "Admin dashboard".green(), addr);
         if enabled_count > 0 {
             println!(
                 "{}: {} profiles auto-started",
@@ -1853,6 +1952,44 @@ mod tests {
         assert!(
             stdio_task_query_store(true).is_some(),
             "stdio serve must wire a task_query_store"
+        );
+    }
+
+    /// #1973 fix E — a SOURCE-ORDER tripwire, stated plainly for what it is:
+    /// no unit-level harness can boot a real `octos serve --stdio` (the run()
+    /// method is a monolith that binds sockets, opens redb stores, and holds a
+    /// data-dir lock), so this test asserts the one thing the fix changed — in
+    /// `run()`, `spawn_global_master_continuation_drain` is called BEFORE the
+    /// stdio early-return (`stdio_connection`) — by scanning this file's own
+    /// source. It proves wiring ORDER at the call-site level, not runtime
+    /// behavior; a refactor that reorders the two lines trips it immediately.
+    #[test]
+    fn global_drain_spawns_before_the_stdio_early_return() {
+        let src = include_str!("serve.rs");
+        // Needles assembled at runtime so this test's own string literals
+        // cannot satisfy (or double-count) the search.
+        let spawn_needle = format!(
+            "spawn_global_master_continuation_drain{}",
+            "(state.clone());"
+        );
+        let stdio_needle = format!("ui_protocol_transport::stdio_connection{}", "(state)");
+        let spawn_at = src
+            .find(&spawn_needle)
+            .expect("the global drain spawn call must exist in serve.rs");
+        let stdio_at = src
+            .find(&stdio_needle)
+            .expect("the stdio connection call must exist in serve.rs");
+        assert!(
+            spawn_at < stdio_at,
+            "the global master-continuation drain must be spawned BEFORE the stdio \
+             early-return, or headless `serve --stdio` loses its goal-continuation \
+             safety net and escalation-timeout sweep"
+        );
+        assert_eq!(
+            src.matches(&spawn_needle).count(),
+            1,
+            "exactly one drain spawn call site (the pre-#1973 post-stdio site was \
+             MOVED, not duplicated — two loops would burn duplicate sweep I/O)"
         );
     }
 

@@ -725,6 +725,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
         "coding.loop_runtime.v1"
     );
+    assert_eq!(
+        UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+        "coding.monitor_runtime.v1"
+    );
     assert_eq!(UI_PROTOCOL_FEATURE_REVIEW_START_V1, "review.start.v1");
     assert_eq!(
         UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
@@ -780,6 +784,11 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "loop/pause",
             "loop/resume",
             "loop/fire_now",
+            "monitor/create",
+            "monitor/list",
+            "monitor/pause",
+            "monitor/resume",
+            "monitor/delete",
             "review/start",
             "session/list",
             "session/snapshot",
@@ -852,11 +861,15 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "loop/updated",
             "loop/fired",
             "loop/completed",
+            "monitor/fired",
+            "monitor/updated",
+            "monitor/expired",
             "context/compaction_completed",
             "context/compaction_started",
             "context/normalization_reported",
             "peer/staged",
             "peer/closed",
+            "background/activity",
         ]
     );
     assert_eq!(
@@ -899,6 +912,11 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "loop/pause",
             "loop/resume",
             "loop/fire_now",
+            "monitor/create",
+            "monitor/list",
+            "monitor/pause",
+            "monitor/resume",
+            "monitor/delete",
             "review/start",
             "session/list",
             "session/snapshot",
@@ -985,6 +1003,11 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "loop/pause",
                 "loop/resume",
                 "loop/fire_now",
+                "monitor/create",
+                "monitor/list",
+                "monitor/pause",
+                "monitor/resume",
+                "monitor/delete",
                 "review/start",
                 "session/list",
                 "session/snapshot",
@@ -1054,11 +1077,15 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "loop/updated",
                 "loop/fired",
                 "loop/completed",
+                "monitor/fired",
+                "monitor/updated",
+                "monitor/expired",
                 "context/compaction_completed",
                 "context/compaction_started",
                 "context/normalization_reported",
                 "peer/staged",
-                "peer/closed"
+                "peer/closed",
+                "background/activity"
             ],
             "supported_features": [
                 "approval.typed.v1",
@@ -1077,6 +1104,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "coding.agent_control.v1",
                 "coding.goal_runtime.v1",
                 "coding.loop_runtime.v1",
+                "coding.monitor_runtime.v1",
                 "review.start.v1",
                 "context.lifecycle.v1",
                 "harness.task_supervision_inspection.v1",
@@ -1084,6 +1112,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "user_question.v1",
                 "event.voice_audio.v1",
                 "plan.todos.v1",
+                "event.background_activity.v1",
                 "smart_home.v1"
             ]
         })
@@ -2892,6 +2921,7 @@ fn m15_autonomy_notifications_register_methods_and_round_trip() {
                 profile_id: Some("coding".into()),
                 goal: m15_goal_record(),
                 transition_actor: "user".into(),
+                generation: 0,
             }),
             methods::SESSION_GOAL_UPDATED,
         ),
@@ -2902,6 +2932,7 @@ fn m15_autonomy_notifications_register_methods_and_round_trip() {
                 cleared: true,
                 goal: None,
                 transition_actor: "user".into(),
+                generation: 0,
             }),
             methods::SESSION_GOAL_CLEARED,
         ),
@@ -3009,6 +3040,83 @@ fn peer_staged_notification_roundtrips_and_keeps_peer_topic() {
     .into_rpc_notification()
     .expect("serialize plain peer/staged");
     assert!(plain.params.get("worktree_branch").is_none());
+}
+
+/// #2019 — `background/activity` is the HUMAN sink over events that today
+/// only wake the model. The routing key is the session that OWNS the emitter,
+/// and it must survive the wire boundary intact: an event that loses (or never
+/// carries) `session_id` renders in whichever session happens to be focused
+/// (octos-tui#461/#466/#483). Attribution and the visible drop marker must
+/// survive too.
+#[test]
+fn should_route_on_owning_session_when_background_activity_crosses_the_wire() {
+    let owner = SessionKey("dev:local:tui#coding".into());
+    let other = SessionKey("dev:local:tui#review".into());
+    let event = BackgroundActivityEvent {
+        session_id: owner.clone(),
+        profile_id: Some("dev".into()),
+        origin_kind: "monitor".into(),
+        origin_id: "mon-7".into(),
+        origin_label: Some("ci-tail".into()),
+        text: "ERROR bus test flaked".into(),
+        emitted_at_ms: 1_760_000_000_000,
+        dropped_count: None,
+        suppressed: false,
+    };
+    let notification = UiNotification::BackgroundActivity(event.clone());
+
+    assert_eq!(notification.method(), methods::BACKGROUND_ACTIVITY);
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::BACKGROUND_ACTIVITY));
+    assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1));
+
+    let rpc = notification
+        .clone()
+        .into_rpc_notification()
+        .expect("serialize background/activity");
+    assert_eq!(rpc.method, methods::BACKGROUND_ACTIVITY);
+    // ROUTING, not merely emission: the wire frame names the OWNING session,
+    // never the sibling a client might happen to have focused.
+    assert_eq!(rpc.params["session_id"], owner.0);
+    assert_ne!(rpc.params["session_id"], other.0);
+    // Attribution rides along — an unattributed line reads as the master.
+    assert_eq!(rpc.params["origin_kind"], "monitor");
+    assert_eq!(rpc.params["origin_id"], "mon-7");
+    assert_eq!(rpc.params["origin_label"], "ci-tail");
+
+    let decoded = UiNotification::from_rpc_notification(rpc).expect("decode background/activity");
+    assert_eq!(decoded, notification);
+    assert_eq!(decoded.session_id(), &owner);
+    assert_eq!(decoded.topic(), Some("coding"));
+}
+
+/// #2019 — the cap's drop marker must be explicitly representable on the wire:
+/// silent truncation reads as "nothing more happened".
+#[test]
+fn should_carry_a_visible_drop_marker_when_background_activity_is_capped() {
+    let marker = UiNotification::BackgroundActivity(BackgroundActivityEvent {
+        session_id: SessionKey("dev:local:tui".into()),
+        profile_id: None,
+        origin_kind: "monitor".into(),
+        origin_id: "mon-7".into(),
+        origin_label: None,
+        text: "further events from this monitor suppressed".into(),
+        emitted_at_ms: 1_760_000_000_001,
+        dropped_count: Some(9),
+        suppressed: true,
+    });
+    let rpc = marker
+        .clone()
+        .into_rpc_notification()
+        .expect("serialize drop marker");
+    assert_eq!(rpc.params["suppressed"], true);
+    assert_eq!(rpc.params["dropped_count"], 9);
+    // Absent optionals stay off the wire.
+    assert!(rpc.params.get("origin_label").is_none());
+    assert!(rpc.params.get("profile_id").is_none());
+    assert_eq!(
+        UiNotification::from_rpc_notification(rpc).expect("decode drop marker"),
+        marker
+    );
 }
 
 /// `peer/closed` round-trips through the wire boundary with the originating
@@ -6989,4 +7097,148 @@ fn smart_home_methods_are_gated_on_smart_home_v1() {
         full.supported_features
             .contains(&UI_PROTOCOL_FEATURE_SMART_HOME_V1.to_string())
     );
+}
+
+/// #1977 — the `coding.monitor_runtime.v1` feature gates all 5 monitor
+/// methods, mirroring the loop family's gating.
+#[test]
+fn monitor_methods_are_gated_on_monitor_runtime_v1() {
+    for method in [
+        methods::MONITOR_CREATE,
+        methods::MONITOR_LIST,
+        methods::MONITOR_PAUSE,
+        methods::MONITOR_RESUME,
+        methods::MONITOR_DELETE,
+    ] {
+        assert_eq!(
+            method_capability_gate(method),
+            Some(UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1),
+            "{method} must be gated on coding.monitor_runtime.v1"
+        );
+    }
+
+    let full = UiProtocolCapabilities::full_protocol();
+    assert!(
+        full.supported_features
+            .contains(&UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1.to_string())
+    );
+
+    // Like the other coding.* optional features, monitor runtime is only
+    // honoured when the autonomy base feature is also requested.
+    let without_base = UiProtocolCapabilities::for_negotiated_features([
+        UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    ]);
+    assert!(
+        !without_base
+            .supported_features
+            .contains(&UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1.to_string()),
+        "monitor runtime must not be advertised without coding.autonomy.v1"
+    );
+    assert!(!without_base.supports_method(methods::MONITOR_CREATE));
+
+    let with_base = UiProtocolCapabilities::for_negotiated_features([
+        UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+        UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    ]);
+    assert!(
+        with_base
+            .supported_features
+            .contains(&UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1.to_string())
+    );
+    for method in [
+        methods::MONITOR_CREATE,
+        methods::MONITOR_LIST,
+        methods::MONITOR_PAUSE,
+        methods::MONITOR_RESUME,
+        methods::MONITOR_DELETE,
+    ] {
+        assert!(
+            with_base.supports_method(method),
+            "{method} must be advertised once negotiated"
+        );
+    }
+}
+
+/// #1977 — monitor typed error kinds mirror the loop_* error family shape.
+#[test]
+fn monitor_error_kinds_are_registered() {
+    assert_eq!(autonomy_error_kinds::MONITOR_NOT_FOUND, "monitor_not_found");
+    assert_eq!(
+        autonomy_error_kinds::MONITOR_INVALID_SPEC,
+        "monitor_invalid_spec"
+    );
+    assert_eq!(
+        autonomy_error_kinds::MONITOR_POLICY_DENIED,
+        "monitor_policy_denied"
+    );
+    assert_eq!(autonomy_error_kinds::MONITOR_FLOODED, "monitor_flooded");
+}
+
+/// #1977 — the monitor notifications roundtrip through `UiNotification`
+/// encode/decode like the loop notifications they mirror.
+#[test]
+fn monitor_notifications_roundtrip_as_ui_notifications() {
+    let record = UiMonitorRecord {
+        monitor_id: "monitor_01".into(),
+        session_id: SessionKey("local:demo".into()),
+        profile_id: Some("main".into()),
+        name: "ledger-watch".into(),
+        argv: vec!["sh".into(), "-c".into(), "cat state".into()],
+        filter_regex: Some("^change:".into()),
+        mode: "poll".into(),
+        interval_seconds: Some(3),
+        batch_ms: 200,
+        max_events_per_hour: 60,
+        persistent: false,
+        status: "active".into(),
+        pause_reason: None,
+        goal_id: None,
+        last_fired_at_ms: Some(1_000),
+        fires_used: 1,
+        expires_at_ms: Some(2_000),
+        created_at_ms: 500,
+        updated_at_ms: 1_000,
+    };
+
+    let updated = UiNotification::MonitorUpdated(MonitorUpdatedEvent {
+        session_id: SessionKey("local:demo".into()),
+        profile_id: Some("main".into()),
+        monitor_id: Some("monitor_01".into()),
+        monitor_state: record.clone(),
+        ok: Some(true),
+        status: Some("active".into()),
+        deleted: None,
+    });
+    assert_eq!(updated.method(), methods::MONITOR_UPDATED);
+    assert_eq!(updated.session_id(), &SessionKey("local:demo".into()));
+    let rpc = updated.clone().into_rpc_notification().expect("encode");
+    let decoded = UiNotification::from_rpc_notification(rpc).expect("decode monitor/updated");
+    assert_eq!(decoded, updated);
+
+    let fired = UiNotification::MonitorFired(MonitorFiredEvent {
+        session_id: SessionKey("local:demo".into()),
+        profile_id: Some("main".into()),
+        monitor_id: "monitor_01".into(),
+        name: Some("ledger-watch".into()),
+        line_count: Some(3),
+        fired_at_ms: Some(1_000),
+    });
+    assert_eq!(fired.method(), methods::MONITOR_FIRED);
+    let rpc = fired.clone().into_rpc_notification().expect("encode");
+    let decoded = UiNotification::from_rpc_notification(rpc).expect("decode monitor/fired");
+    assert_eq!(decoded, fired);
+
+    let expired = UiNotification::MonitorExpired(MonitorExpiredEvent {
+        session_id: SessionKey("local:demo".into()),
+        profile_id: Some("main".into()),
+        monitor_id: "monitor_01".into(),
+        monitor_state: Some(record),
+        status: Some("expired".into()),
+        expired_at_ms: Some(2_000),
+        reason: Some("timeout".into()),
+    });
+    assert_eq!(expired.method(), methods::MONITOR_EXPIRED);
+    let rpc = expired.clone().into_rpc_notification().expect("encode");
+    let decoded = UiNotification::from_rpc_notification(rpc).expect("decode monitor/expired");
+    assert_eq!(decoded, expired);
 }

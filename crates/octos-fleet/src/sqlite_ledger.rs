@@ -18,7 +18,9 @@ pub struct GoalLedger {
 pub struct Goal {
     pub goal_id: String,
     pub objective: String,
-    pub status: String, // active | complete | blocked | budget_limited | paused
+    // `cleared` (#1973 fix B) is the terminal a user `goal_clear` stamps; the
+    // upsert guard still refuses to downgrade a `complete` row to it.
+    pub status: String, // active | complete | blocked | budget_limited | paused | cleared
     pub tokens_used: u64,
     pub token_budget: u64,
     pub continuations_used: u32,
@@ -88,6 +90,12 @@ pub struct Escalation {
     pub resolution: Option<String>,
 }
 
+/// #1967 — the one column list every escalation SELECT shares; order is the
+/// contract [`GoalLedger::escalation_from_row`] maps by index.
+const ESCALATION_SELECT_COLUMNS: &str = "escalation_id, goal_id, task_id, peer_id, question, \
+     context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, \
+     resolved_by, resolution";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub decision_id: String,
@@ -103,15 +111,107 @@ pub struct Decision {
     pub decided_by: String,
 }
 
+/// #1865 review FIX 1 — whether an error from a ledger op is SQLITE_BUSY /
+/// SQLITE_LOCKED-class lock contention (worth a brief retry) as opposed to a
+/// structural failure (missing parent dir, corrupt file, permissions) that
+/// retrying can never fix. Lives here — not in callers — because only this
+/// crate sees `rusqlite` and can classify by the REAL error code instead of
+/// string-matching messages.
+pub fn error_is_lock_contention(err: &eyre::Report) -> bool {
+    let Some(sqlite_err) = err.downcast_ref::<rusqlite::Error>() else {
+        return false;
+    };
+    matches!(
+        sqlite_err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 impl GoalLedger {
     /// Open (or create) the SQLite ledger at `path`, creating all tables.
+    ///
+    /// DEFAULT (pre-#1865) profile — review round 3: NO explicit
+    /// `busy_timeout`, which means rusqlite's own default applies (rusqlite
+    /// installs `sqlite3_busy_timeout(db, 5000)` on every connection — see
+    /// rusqlite `inner_connection.rs`). That is BYTE-EQUIVALENT to what every
+    /// pre-existing inline caller (the finding / escalation writers and
+    /// `goal_get`'s serial ledger reads, all on tokio worker tasks) has
+    /// always run with: handler-covered contention waits up to ~5s, while the
+    /// fresh-db concurrent-init race fails instantly through a
+    /// handler-bypassing path (the historically observed `database is
+    /// locked`). Do NOT add an explicit timeout here in either direction —
+    /// shorter would newly skip best-effort writes that today wait and
+    /// succeed; the transition sync that must SURVIVE the init race uses
+    /// [`Self::open_with_busy_retry`] from a blocking thread instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path.as_ref(), None)
+    }
+
+    /// #1865 review FIX 1 — BOUNDED-RETRY profile of [`Self::open`], for the
+    /// goal-transition ledger sync ONLY (octos-cli runs it inside
+    /// `spawn_blocking`, never on an executor worker). Two connections
+    /// initializing the SAME fresh WAL db can fail `database is locked`
+    /// through a path the busy handler does NOT cover (observed empirically
+    /// on concurrent FIRST initialization — the wal-index/shm recovery lock;
+    /// the journal-mode switch itself IS handler-covered, see the contention
+    /// test), so a one-shot open can lose a millisecond init race outright —
+    /// and that loss silently drops the audit row.
+    ///
+    /// Retries at most 3 attempts, ONLY when [`error_is_lock_contention`]
+    /// classifies the failure as BUSY/LOCKED (structural errors return
+    /// immediately), with 50ms between attempts — and THIS profile's
+    /// connection overrides the busy_timeout DOWN to 1s. Honest bound math:
+    /// busy_timeout is PER lock acquisition, not per call — one attempt runs
+    /// a handful of locking ops (journal-mode pragma, schema batch), so a
+    /// pathological attempt can block a small multiple of 1s, and the 3-try
+    /// cap keeps the PRACTICAL worst case in single-digit seconds. That is a
+    /// blocking-pool budget, not a wall-clock guarantee.
+    pub fn open_with_busy_retry(path: impl AsRef<Path>) -> Result<Self> {
+        const ATTEMPTS: usize = 3;
+        let path = path.as_ref();
+        let mut last_err: Option<eyre::Report> = None;
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            match Self::open_inner(path, Some(std::time::Duration::from_secs(1))) {
+                Ok(ledger) => return Ok(ledger),
+                Err(err) if error_is_lock_contention(&err) && attempt + 1 < ATTEMPTS => {
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| eyre::eyre!("ledger open retry exhausted")))
+    }
+
+    /// The shared open core: connection, optional busy_timeout OVERRIDE (the
+    /// ONLY difference between the two public profiles above; `None` keeps
+    /// rusqlite's 5s default), WAL + synchronous pragmas, schema. An override
+    /// persists for the connection's lifetime, so a retry-profile ledger caps
+    /// each later row-write wait at 1s too — fine, because that profile never
+    /// runs on an executor worker.
+    fn open_inner(path: &Path, busy_timeout: Option<std::time::Duration>) -> Result<Self> {
         let conn = Connection::open(path)?;
+
+        if let Some(timeout) = busy_timeout {
+            conn.busy_timeout(timeout)?;
+        }
 
         // Enable WAL mode for multi-process access
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
+        Self::create_tables(&conn)?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// The shared `CREATE TABLE IF NOT EXISTS` schema batch (split out of
+    /// [`Self::open`] so the retry wrapper stays a thin loop over it).
+    fn create_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS goals (
@@ -201,10 +301,7 @@ impl GoalLedger {
             CREATE INDEX IF NOT EXISTS idx_decisions_goal ON decisions(goal_id, decided_at_ms);
             ",
         )?;
-
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(())
     }
 
     /// Create a new goal.
@@ -226,6 +323,138 @@ impl GoalLedger {
             ],
         )?;
         Ok(())
+    }
+
+    /// #1957 — upsert the goal row with its REAL fields. `create_goal` was the
+    /// only writer and callers used a placeholder (objective empty, status
+    /// stale, tokens 0) purely to satisfy the findings/escalations FK, so an
+    /// audit of the ledger saw no real goal state. This writes the authoritative
+    /// objective/status/tokens/budget on first use AND keeps them fresh on every
+    /// later call. `created_at_ms` and `revision` are preserved on conflict.
+    ///
+    /// #1957 codex #2 — the UPDATE is GUARDED so a stale snapshot cannot undo a
+    /// newer one. Three clauses:
+    ///  1. `updated_at_ms >=`: only overwrite when the incoming snapshot is at
+    ///     least as new as the stored row. Both producers (the transition sync
+    ///     and the finding/escalation path) capture `status` and `updated_at_ms`
+    ///     together under the orchestrator state lock, so a stale status always
+    ///     carries a stale timestamp and this clause rejects it. `>=` (not `>`)
+    ///     keeps same-instant re-writes of the SAME state idempotent.
+    ///  2. `tokens_used >=` (#1965 codex round): the counter is MONOTONIC per
+    ///     `goal_id` — every in-memory writer only ever `saturating_add`s, a
+    ///     replacement goal mints a FRESH goal_id (different ledger file), and
+    ///     re-activation never resets counters. Two peers finishing in the
+    ///     SAME millisecond tie on clause 1, so without this clause the
+    ///     smaller charge upserting second would roll the durable counter
+    ///     backwards while memory holds the higher total.
+    ///  3. never downgrade a `complete` row to a non-`complete` status. This is
+    ///     defence-in-depth against the millisecond-resolution tie the `>=`
+    ///     clause alone cannot break: `complete` is terminal for a given
+    ///     `goal_id` (re-activation mints a FRESH goal_id), so no legitimate
+    ///     writer ever moves an existing `complete` row back to active/blocked.
+    ///     `blocked` is deliberately NOT protected — a blocked goal is
+    ///     user-resumable to `active` under the same id.
+    ///
+    /// #1973 fix-round — returns whether the write was ADMITTED (`true`: the
+    /// row was inserted, or the guarded update fired), via SQLite's
+    /// rows-changed count. A guarded rejection returns `false`, so an
+    /// administrative STATUS sync (park/clear) whose snapshot carries stale
+    /// lower counters can detect the loss and retry once with max'd monotonic
+    /// fields — instead of silently leaving the row on its old status while a
+    /// decision row claims the transition happened.
+    pub fn upsert_goal(&self, goal: &Goal) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let admitted = conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 tokens_used = excluded.tokens_used,
+                 token_budget = excluded.token_budget,
+                 continuations_used = excluded.continuations_used,
+                 updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.updated_at_ms >= goals.updated_at_ms
+               AND excluded.tokens_used >= goals.tokens_used
+               AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.status,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        Ok(admitted > 0)
+    }
+
+    /// #1973 fix-round 3/4 — targeted STATUS compare-and-swap for an
+    /// administrative transition (park/clear) whose guarded [`Self::upsert_goal`]
+    /// was rejected by the monotonic-token clause. Flips ONLY the status (+
+    /// `updated_at_ms`); the row's counters are authoritative and untouched.
+    ///
+    /// A TRUE CAS (round-4 codex): the predicate requires the row to still
+    /// carry the EXACT `(expected_status, expected_updated_at_ms)` pair the
+    /// caller just read — so ANY interleaved write, including a same-status
+    /// counters refresh with a newer timestamp, changes the pair and defeats
+    /// the CAS (a status-only predicate admitted that interleave and could
+    /// stamp an older `updated_at_ms` over a newer row: a clock REGRESSION
+    /// that then let a delayed older transition pass the caller's ordering
+    /// gate). `status <> 'complete'` stays as belt-and-suspenders (complete
+    /// is terminal per goal_id; the caller never reads `complete` as its
+    /// expectation anyway). Returns whether a row changed — the caller's
+    /// decision-append gate; a defeated CAS is NOT re-attempted (one shot —
+    /// the newer state wins).
+    ///
+    /// Clock invariant: the caller gates the CAS on
+    /// `snapshot.updated_at_ms >= expected_updated_at_ms` (the row value it
+    /// read), and the CAS fires only while the row STILL carries exactly that
+    /// value — so the stamp written here is always `>=` the timestamp it
+    /// replaces. `updated_at_ms` never regresses. The one interleave the pair
+    /// cannot detect — an equal-timestamp, same-status write (counters-only,
+    /// same millisecond) — is safe by construction: the CAS writes only
+    /// status + timestamp, so the interleaved counters survive untouched.
+    pub fn cas_goal_status(
+        &self,
+        goal_id: &str,
+        new_status: &str,
+        expected_status: &str,
+        expected_updated_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE goals SET status = ?1, updated_at_ms = ?2
+             WHERE goal_id = ?3 AND status = ?4 AND updated_at_ms = ?5
+               AND status <> 'complete'",
+            params![
+                new_status,
+                updated_at_ms,
+                goal_id,
+                expected_status,
+                expected_updated_at_ms
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// #1973 fix-round — number of decision rows recorded for `goal_id`. The
+    /// audit-side counterpart to [`Self::append_decision`]: the transition
+    /// sync appends a decision ONLY when the goals-row actually reflects the
+    /// transition, and this reader lets callers (and tests) verify the two
+    /// never diverge.
+    pub fn count_decisions(&self, goal_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE goal_id = ?1",
+            params![goal_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     /// Get a goal by ID.
@@ -486,6 +715,122 @@ impl GoalLedger {
         Ok(rowid)
     }
 
+    /// #1961 — mark this peer's OPEN escalation resolved. `append_escalation`
+    /// only ever wrote the `open` row; without this the ledger's escalation
+    /// history showed every answered escalation as perpetually open. A peer
+    /// parks one prompt at a time (depth-1), so matching `peer_id` + the
+    /// `open` status resolves exactly the escalation just answered. Returns the
+    /// number of rows updated (0 when there was no open escalation — e.g. an
+    /// approval on a goal-less peer, or a double-resolve).
+    ///
+    /// #1967 — this bulk-by-peer form stays the right call for the ANSWER and
+    /// CLOSE paths ("everything open for this peer" IS the one escalation the
+    /// depth-1 peer parked on / abandoned). The timeout sweep instead addresses
+    /// individual rows via [`Self::resolve_escalation_by_id`].
+    pub fn resolve_escalation(
+        &self,
+        peer_id: &str,
+        resolution: &str,
+        resolved_by: &str,
+        resolved_at_ms: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE escalations
+             SET status = 'resolved', resolution = ?1, resolved_by = ?2, resolved_at_ms = ?3
+             WHERE peer_id = ?4 AND status = 'open'",
+            params![resolution, resolved_by, resolved_at_ms, peer_id],
+        )?;
+        Ok(updated)
+    }
+
+    /// #1967 — shared row → [`Escalation`] mapper for the SELECT paths below.
+    /// Column order must match [`ESCALATION_SELECT_COLUMNS`].
+    fn escalation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
+        Ok(Escalation {
+            escalation_id: row.get(0)?,
+            goal_id: row.get(1)?,
+            task_id: row.get(2)?,
+            peer_id: row.get(3)?,
+            question: row.get(4)?,
+            context: row.get(5)?,
+            status: row.get(6)?,
+            default_action: row.get(7)?,
+            default_after_secs: row.get(8)?,
+            created_at_ms: row.get(9)?,
+            resolved_at_ms: row.get(10)?,
+            resolved_by: row.get(11)?,
+            resolution: row.get(12)?,
+        })
+    }
+
+    /// #1967 — the READ half of the escalation lifecycle. Producers wrote rows
+    /// (`append_escalation`) and the answer path flipped them
+    /// (`resolve_escalation`), but no production SELECT existed — an open
+    /// escalation was invisible to the master model. `goal_get` folds these in
+    /// via `model_goal_ledger_open_escalations`; oldest first so the master
+    /// answers in park order.
+    pub fn list_open_escalations(&self, goal_id: &str) -> Result<Vec<Escalation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ESCALATION_SELECT_COLUMNS} FROM escalations
+             WHERE goal_id = ?1 AND status = 'open'
+             ORDER BY created_at_ms ASC"
+        ))?;
+        let rows = stmt
+            .query_map(params![goal_id], Self::escalation_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// #1967 — TARGETED resolve: flip ONE escalation by primary key, provided
+    /// it is still `open`. Returns whether a row flipped (`false` = unknown id
+    /// or already resolved — a recorded resolution is never clobbered). Used
+    /// by the timeout sweep, which addresses each expired row individually;
+    /// the answer/close paths use the peer_id-bulk
+    /// [`Self::resolve_escalation`] instead (see its doc).
+    pub fn resolve_escalation_by_id(
+        &self,
+        escalation_id: &str,
+        resolution: &str,
+        resolved_by: &str,
+    ) -> Result<bool> {
+        let resolved_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE escalations
+             SET status = 'resolved', resolution = ?1, resolved_by = ?2, resolved_at_ms = ?3
+             WHERE escalation_id = ?4 AND status = 'open'",
+            params![resolution, resolved_by, resolved_at_ms, escalation_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// #1967 — timeout candidates for the escalation sweep: OPEN rows whose
+    /// `default_after_secs` timer has ELAPSED (`created_at_ms +
+    /// default_after_secs*1000 < now_ms`, strict). Deliberately NO goal
+    /// filter: the sweep addresses one per-goal ledger FILE, and the filename
+    /// is a lossy `sanitize_filename_for_ledger` mapping so the goal_id cannot
+    /// be recovered from the path — the rows carry it. Rows without a default
+    /// never qualify (the master must answer them via peer_respond, or
+    /// peer_close resolves them).
+    pub fn list_expired_open_escalations(&self, now_ms: i64) -> Result<Vec<Escalation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ESCALATION_SELECT_COLUMNS} FROM escalations
+             WHERE status = 'open' AND default_after_secs IS NOT NULL
+               AND created_at_ms + default_after_secs * 1000 < ?1
+             ORDER BY created_at_ms ASC"
+        ))?;
+        let rows = stmt
+            .query_map(params![now_ms], Self::escalation_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Append a decision to the ledger.
     pub fn append_decision(&self, decision: &Decision) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
@@ -538,6 +883,38 @@ impl GoalLedger {
         let rowid = tx.last_insert_rowid();
         tx.commit()?;
         Ok(rowid)
+    }
+
+    /// #1964 — all decisions recorded for `goal_id`, ordered by
+    /// `decided_at_ms` (ties by insertion rowid). The read half of
+    /// [`Self::append_decision`]: fleet-driven goal terminals now append an
+    /// audit decision (#1865 eager convergence / deny), and their tests assert
+    /// exactly-one-per-transition through this.
+    pub fn list_decisions(&self, goal_id: &str) -> Result<Vec<Decision>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT decision_id, goal_id, task_id, question, options_considered, choice, \
+             rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by \
+             FROM decisions WHERE goal_id = ?1 ORDER BY decided_at_ms ASC, rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![goal_id], |row| {
+                Ok(Decision {
+                    decision_id: row.get(0)?,
+                    goal_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    question: row.get(3)?,
+                    options_considered: row.get(4)?,
+                    choice: row.get(5)?,
+                    rationale: row.get(6)?,
+                    based_on_findings: row.get(7)?,
+                    based_on_rev: row.get(8)?,
+                    decided_at_ms: row.get(9)?,
+                    decided_by: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Atomically commit state change + audit record (finding + decision).
@@ -639,6 +1016,78 @@ impl GoalLedger {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(findings)
     }
+
+    /// #1945 — count this goal's tasks per status (pending/running/complete/
+    /// failed), sorted by status for a stable shape. The tasks half of the
+    /// `goal_get` `ledger_digest`: the re-orienting master reads counts, never
+    /// rows, so this stays fixed-size however large the plan grows. NOTE:
+    /// today's only production task writer is the FK stub in
+    /// `model_goal_record_peer_finding` (octos-cli), which inserts `running`
+    /// rows and never updates them — so production counts read
+    /// `{"running": N}` until a real task-status writer lands.
+    pub fn task_status_counts(&self, goal_id: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM tasks WHERE goal_id = ?1 GROUP BY status ORDER BY status",
+        )?;
+        let counts = stmt
+            .query_map(params![goal_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(counts)
+    }
+
+    /// #1945 codex round — count this goal's findings per raw `lifecycle`
+    /// (proposed/observed/…), sorted by lifecycle. A direct GROUP BY over ALL
+    /// findings — INCLUDING `task_id IS NULL` rows, which the digest's
+    /// per-path roll-up skips and which are exactly what ordinary peers write
+    /// (peer_handoff stages no fleet task).
+    pub fn findings_count_by_lifecycle(&self, goal_id: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT lifecycle, COUNT(*) FROM findings WHERE goal_id = ?1 \
+             GROUP BY lifecycle ORDER BY lifecycle",
+        )?;
+        let counts = stmt
+            .query_map(params![goal_id], |row| {
+                let n: i64 = row.get(1)?;
+                Ok((row.get(0)?, u64::try_from(n).unwrap_or(0)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(counts)
+    }
+
+    /// #1945 codex round — count this goal's findings per `kind`
+    /// (observation/hypothesis/…), sorted by kind. Same ALL-rows semantics as
+    /// [`Self::findings_count_by_lifecycle`].
+    pub fn findings_count_by_kind(&self, goal_id: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM findings WHERE goal_id = ?1 \
+             GROUP BY kind ORDER BY kind",
+        )?;
+        let counts = stmt
+            .query_map(params![goal_id], |row| {
+                let n: i64 = row.get(1)?;
+                Ok((row.get(0)?, u64::try_from(n).unwrap_or(0)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(counts)
+    }
+
+    /// #1945 codex round — the goal's total learning cost:
+    /// `COALESCE(SUM(cost_tokens), 0)` over ALL findings, task-scoped or not
+    /// (the digest's `cost_by_path` drops `task_id IS NULL` rows — the ones
+    /// the #1965 cost lane populates). Saturating `i64 → u64`, no unchecked
+    /// casts; an empty goal sums to 0, not NULL.
+    pub fn total_cost_tokens(&self, goal_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_tokens), 0) FROM findings WHERE goal_id = ?1",
+            params![goal_id],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -706,7 +1155,9 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
-            cost_tokens: 0,
+            // #1965 — a REAL cost, so the round-trip below proves the row
+            // persists the caller's spend instead of a hardcoded 0.
+            cost_tokens: 4_321,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -715,6 +1166,184 @@ mod tests {
         let findings = ledger.list_findings_since("g1", 0).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].assertion, "test assertion");
+        assert_eq!(
+            findings[0].cost_tokens, 4_321,
+            "Finding row must persist the real cost_tokens (#1965)"
+        );
+    }
+
+    /// #1865 review round 3 — the TWO open profiles under handler-covered
+    /// contention (a fresh, still-DELETE-mode db whose lock is held by a raw
+    /// connection, so `open`'s `journal_mode=WAL` switch must wait): plain
+    /// `open` keeps rusqlite's DEFAULT 5s busy handler — byte-equivalent to
+    /// what every pre-existing inline caller has always run with (NOT our 1s
+    /// override, NOT zero) — while `open_with_busy_retry` overrides each lock
+    /// acquisition DOWN to 1s and retries lock-class failures a bounded
+    /// number of times. NOTE an already-WAL, already-created ledger does not
+    /// contend on open at all (pragma + `CREATE TABLE IF NOT EXISTS` resolve
+    /// without the write lock), so the fresh-db path is the one pinned here.
+    /// Deliberately slow (~8s of real lock-waiting): this is the regression
+    /// pin for the blocker where an explicit timeout on `open` changed every
+    /// inline caller's blocking profile.
+    #[test]
+    fn open_keeps_rusqlite_default_busy_handling_while_retry_profile_bounds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        // DEFAULT profile: waits rusqlite's built-in ~5s
+        // (`sqlite3_busy_timeout(db, 5000)` in rusqlite inner_connection.rs)
+        // and then surfaces a busy-class error. `>= 2s` pins that no explicit
+        // SHORTER override (like the retry profile's 1s — or a fail-fast 0)
+        // was reintroduced on this path.
+        let started = std::time::Instant::now();
+        let err = GoalLedger::open(&path)
+            .err()
+            .expect("write-locked db must fail a plain open once the default handler expires");
+        assert!(
+            error_is_lock_contention(&err),
+            "the default-profile failure must be busy-class: {err}",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2)
+                && elapsed < std::time::Duration::from_secs(15),
+            "plain open must keep rusqlite's default (~5s) busy handling, \
+             byte-equivalent to pre-#1865 inline callers: took {elapsed:?}",
+        );
+
+        // BOUNDED-RETRY profile: the 1s per-acquisition override makes each
+        // attempt wait ~1s on the held journal-mode switch; 3 attempts + 50ms
+        // sleeps ≈ 3.1s here, then the same busy-class error surfaces.
+        let started = std::time::Instant::now();
+        let err = GoalLedger::open_with_busy_retry(&path)
+            .err()
+            .expect("still locked: retries must exhaust");
+        assert!(
+            error_is_lock_contention(&err),
+            "busy-class after retries: {err}",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1)
+                && elapsed < std::time::Duration::from_secs(10),
+            "the retry profile must wait ~1s per acquisition, bounded by the \
+             3-attempt cap: took {elapsed:?}",
+        );
+    }
+
+    /// #1865 review FIX 1 — `open_with_busy_retry` (a) succeeds like `open` on
+    /// a healthy path, and (b) classifies ONLY SQLITE_BUSY/LOCKED-class errors
+    /// as retryable: a structural failure (opening a DIRECTORY) must return
+    /// its error immediately, with no retry sleeps burned on it.
+    #[test]
+    fn open_with_busy_retry_round_trips_and_refuses_non_busy_errors() {
+        // (a) healthy open behaves like `open` (WAL, tables created).
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open_with_busy_retry(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "retry open".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        assert!(ledger.get_goal("g1").unwrap().is_some());
+
+        // (b) a non-busy error is NOT retried: opening a directory fails
+        // structurally; with 2 inter-attempt sleeps it would take >=100ms, so
+        // a fast error proves the busy-only classification short-circuited.
+        let started = std::time::Instant::now();
+        assert!(GoalLedger::open_with_busy_retry(dir.path()).is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "a structural (non-busy) open error must fail fast, not retry: took {:?}",
+            started.elapsed(),
+        );
+
+        // Classifier unit coverage: busy/locked codes retry, others do not.
+        let busy = eyre::Report::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        ));
+        let locked = eyre::Report::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            Some("database table is locked".into()),
+        ));
+        let structural = eyre::Report::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some("unable to open database file".into()),
+        ));
+        assert!(error_is_lock_contention(&busy));
+        assert!(error_is_lock_contention(&locked));
+        assert!(!error_is_lock_contention(&structural));
+    }
+
+    /// #1964 — `list_decisions` round-trips appended decisions for ONE goal in
+    /// decided_at order. The fleet-convergence tests (octos-cli) use it to
+    /// assert an eager fleet terminal appended exactly one audit decision.
+    #[test]
+    fn list_decisions_round_trips_per_goal_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        for gid in ["g1", "g2"] {
+            ledger
+                .create_goal(&Goal {
+                    goal_id: gid.to_string(),
+                    objective: "test".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 0,
+                    token_budget: 10_000,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap();
+        }
+        let decision = |id: &str, goal: &str, at: u64| Decision {
+            decision_id: id.to_string(),
+            goal_id: goal.to_string(),
+            task_id: None,
+            question: format!("q-{id}"),
+            options_considered: None,
+            choice: "complete".to_string(),
+            rationale: "all fleet tasks accepted".to_string(),
+            based_on_findings: None,
+            based_on_rev: 0,
+            decided_at_ms: at,
+            decided_by: "keeper".to_string(),
+        };
+        // Append out of decided_at order + one row on ANOTHER goal.
+        ledger
+            .append_decision(&decision("d2", "g1", 2_000))
+            .unwrap();
+        ledger
+            .append_decision(&decision("d1", "g1", 1_500))
+            .unwrap();
+        ledger
+            .append_decision(&decision("dx", "g2", 1_700))
+            .unwrap();
+
+        let rows = ledger.list_decisions("g1").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|d| d.decision_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d1", "d2"],
+            "g1's decisions only, ordered by decided_at_ms",
+        );
+        assert_eq!(rows[0].choice, "complete");
+        assert_eq!(rows[0].rationale, "all fleet tasks accepted");
+        assert_eq!(rows[0].decided_by, "keeper");
+        assert!(ledger.list_decisions("missing").unwrap().is_empty());
     }
 
     #[test]
@@ -1348,5 +1977,929 @@ mod digest_integration_tests {
                 lifecycle, expected_status
             );
         }
+    }
+
+    // #1945 — the goal_get `ledger_digest` read path reduces the digest to
+    // COUNTS; this proves the counts it derives are right over a ledger with
+    // mixed lifecycles, a supersession, and per-path cost. The lifecycle →
+    // FindingStatus mapping is the `From<&Finding>` conversion above:
+    // verified/reproduced → Confirmed, proposed/observed → Predicted,
+    // refuted/superseded/retracted → RuledOut.
+    #[test]
+    fn digest_from_ledger_counts_mixed_lifecycles_and_supersession() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "count me".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        for (task_id, status) in [("t-run", "running"), ("t-done", "complete")] {
+            ledger
+                .create_task(&Task {
+                    task_id: task_id.to_string(),
+                    goal_id: "g1".to_string(),
+                    title: task_id.to_string(),
+                    detail: "test".to_string(),
+                    status: status.to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1000,
+                })
+                .unwrap();
+        }
+        // (finding_id, task, kind, lifecycle, cost, supersedes)
+        type SeedRow = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            u64,
+            Vec<&'static str>,
+        );
+        let rows: [SeedRow; 4] = [
+            ("f1", "t-run", "hypothesis", "observed", 100, vec![]),
+            ("f2", "t-run", "observation", "verified", 200, vec![]),
+            ("f3", "t-done", "observation", "refuted", 300, vec![]),
+            // f4 overturns f1: f1 leaves the live frontier, f4 joins it.
+            ("f4", "t-done", "diagnosis", "verified", 400, vec!["f1"]),
+        ];
+        for (finding_id, task_id, kind, lifecycle, cost, supersedes) in rows {
+            ledger
+                .append_finding(&Finding {
+                    rowid: None,
+                    finding_id: finding_id.to_string(),
+                    seq: 0, // assigned by store
+                    task_id: Some(task_id.to_string()),
+                    goal_id: "g1".to_string(),
+                    kind: kind.to_string(),
+                    lifecycle: lifecycle.to_string(),
+                    confidence: "medium".to_string(),
+                    review_state: "unreviewed".to_string(),
+                    assertion: format!("claim {finding_id}"),
+                    evidence: None,
+                    config_version: None,
+                    derived_from: None,
+                    supersedes: supersedes.into_iter().map(str::to_string).collect(),
+                    cost_tokens: cost,
+                    created_at_ms: 2000,
+                    created_by: "peer-a".to_string(),
+                })
+                .unwrap();
+        }
+
+        let digest = digest_from_ledger(
+            &ledger,
+            "g1",
+            &crate::digest::DigestOptions {
+                max_chars: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // f1 was overturned → 3 live findings, 1 overturn edge, watermark = 4.
+        assert_eq!(digest.new_findings.len(), 3, "superseded f1 is not live");
+        assert!(digest.new_findings.iter().all(|f| f.id != "f1"));
+        assert_eq!(digest.overturns.len(), 1);
+        assert_eq!(digest.overturns[0].overturned, "f1");
+        assert_eq!(digest.watermark, 4);
+        let confirmed = digest
+            .new_findings
+            .iter()
+            .filter(|f| f.status == crate::records::FindingStatus::Confirmed)
+            .count();
+        let ruled_out = digest
+            .new_findings
+            .iter()
+            .filter(|f| f.status == crate::records::FindingStatus::RuledOut)
+            .count();
+        assert_eq!((confirmed, ruled_out), (2, 1), "verified×2 + refuted×1");
+        // `component` carries the ledger `kind` (see `From<&Finding>`), so the
+        // read path can count findings per kind straight off the digest.
+        let observations = digest
+            .new_findings
+            .iter()
+            .filter(|f| f.component == "observation")
+            .count();
+        assert_eq!(observations, 2);
+        // Cost rolls up per path; the total is what `ledger_digest` reports.
+        let total: u64 = digest.cost_by_path.iter().map(|p| p.tokens).sum();
+        assert_eq!(total, 1000, "all four findings' cost, live or not");
+    }
+
+    // #1945 — task counts by status: the tasks half of the goal_get
+    // `ledger_digest`. A read this small must not require listing rows.
+    #[test]
+    fn task_status_counts_groups_this_goals_tasks_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        for gid in ["g1", "g2"] {
+            ledger
+                .create_goal(&Goal {
+                    goal_id: gid.to_string(),
+                    objective: "test".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 0,
+                    token_budget: 10000,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1000,
+                })
+                .unwrap();
+        }
+        for (task_id, goal_id, status) in [
+            ("t1", "g1", "running"),
+            ("t2", "g1", "running"),
+            ("t3", "g1", "complete"),
+            ("t4", "g2", "failed"), // foreign goal — must not be counted
+        ] {
+            ledger
+                .create_task(&Task {
+                    task_id: task_id.to_string(),
+                    goal_id: goal_id.to_string(),
+                    title: task_id.to_string(),
+                    detail: "test".to_string(),
+                    status: status.to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1000,
+                    updated_at_ms: 1000,
+                })
+                .unwrap();
+        }
+        let counts = ledger.task_status_counts("g1").unwrap();
+        assert_eq!(
+            counts,
+            vec![("complete".to_string(), 1), ("running".to_string(), 2)]
+        );
+        assert!(
+            ledger.task_status_counts("g-none").unwrap().is_empty(),
+            "an unknown goal has no task rows"
+        );
+    }
+
+    // #1945 codex round — AGGREGATE UNIT TEST (direct-SQL seeding is fine
+    // here; the integration-shaped tests in octos-cli drive the production
+    // writer instead). The lifecycle/kind/cost aggregates must count EVERY
+    // finding of the goal, including `task_id = NULL` rows — exactly the rows
+    // ordinary peers write (peer_handoff stages no fleet task) and the rows
+    // the digest's per-path cost roll-up drops on the floor.
+    #[test]
+    fn finding_aggregates_count_task_less_rows_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "aggregate me".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        ledger
+            .create_task(&Task {
+                task_id: "t1".to_string(),
+                goal_id: "g1".to_string(),
+                title: "t1".to_string(),
+                detail: "test".to_string(),
+                status: "running".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        // (id, task, kind, lifecycle, cost) — f2 and f3 have NO task_id.
+        let rows: [(&str, Option<&str>, &str, &str, u64); 3] = [
+            ("f1", Some("t1"), "observation", "observed", 100),
+            ("f2", None, "observation", "verified", 200),
+            ("f3", None, "hypothesis", "observed", 300),
+        ];
+        for (id, task, kind, lifecycle, cost) in rows {
+            ledger
+                .append_finding(&Finding {
+                    rowid: None,
+                    finding_id: id.to_string(),
+                    seq: 0, // assigned by store
+                    task_id: task.map(str::to_string),
+                    goal_id: "g1".to_string(),
+                    kind: kind.to_string(),
+                    lifecycle: lifecycle.to_string(),
+                    confidence: "medium".to_string(),
+                    review_state: "unreviewed".to_string(),
+                    assertion: format!("claim {id}"),
+                    evidence: None,
+                    config_version: None,
+                    derived_from: None,
+                    supersedes: Vec::new(),
+                    cost_tokens: cost,
+                    created_at_ms: 2000,
+                    created_by: "peer-a".to_string(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            ledger.findings_count_by_lifecycle("g1").unwrap(),
+            vec![("observed".to_string(), 2), ("verified".to_string(), 1)]
+        );
+        assert_eq!(
+            ledger.findings_count_by_kind("g1").unwrap(),
+            vec![
+                ("hypothesis".to_string(), 1),
+                ("observation".to_string(), 2)
+            ]
+        );
+        assert_eq!(
+            ledger.total_cost_tokens("g1").unwrap(),
+            600,
+            "task-less findings' cost counts too"
+        );
+        assert_eq!(
+            ledger.total_cost_tokens("g-none").unwrap(),
+            0,
+            "no findings sums to 0, not NULL/error"
+        );
+        // The CONTRAST this fix exists for: the path digest's per-path cost
+        // roll-up skips `task_id = NULL` findings entirely (see digest.rs
+        // `cost_by_path`), so summing it loses f2+f3 — which is why the
+        // goal_get `ledger_digest` reads these direct aggregates instead.
+        let digest = digest_from_ledger(
+            &ledger,
+            "g1",
+            &crate::digest::DigestOptions {
+                max_chars: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let per_path_total: u64 = digest.cost_by_path.iter().map(|p| p.tokens).sum();
+        assert_eq!(
+            per_path_total, 100,
+            "cost_by_path only sees the task-scoped finding — the documented \
+             reason ledger_digest must NOT be built from the path digest"
+        );
+    }
+
+    // #1961 — an answered escalation must become `resolved` in the ledger.
+    #[test]
+    fn resolve_escalation_marks_the_open_row_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+        let esc = Escalation {
+            escalation_id: "esc-picker-1".to_string(),
+            goal_id: "g1".to_string(),
+            task_id: None,
+            peer_id: "picker".to_string(),
+            question: "7 or 8?".to_string(),
+            context: None,
+            status: "open".to_string(),
+            default_action: None,
+            default_after_secs: None,
+            created_at_ms: 1000,
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        };
+        ledger.append_escalation(&esc).unwrap();
+
+        let updated = ledger
+            .resolve_escalation("picker", "[answer] 7", "master-session", 2000)
+            .unwrap();
+        assert_eq!(updated, 1, "the one open escalation must be resolved");
+
+        // A second resolve is a no-op (no open rows left) — idempotent.
+        let again = ledger
+            .resolve_escalation("picker", "[answer] 7", "master-session", 2001)
+            .unwrap();
+        assert_eq!(again, 0, "double-resolve must not update anything");
+
+        let conn = ledger.conn.lock().unwrap();
+        let (status, resolution, resolved_by): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolution, resolved_by FROM escalations WHERE escalation_id = 'esc-picker-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "resolved");
+        assert_eq!(resolution.as_deref(), Some("[answer] 7"));
+        assert_eq!(resolved_by.as_deref(), Some("master-session"));
+    }
+
+    // #1957 — upsert_goal writes REAL fields on insert and refreshes the mutable
+    // ones on conflict, so the ledger goals-row is no longer a stale placeholder.
+    #[test]
+    fn upsert_goal_writes_real_fields_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "active".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(got.objective, "compute 6x7");
+        assert_eq!(got.tokens_used, 100);
+        // Second upsert refreshes status/tokens; created_at is preserved.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 550,
+                token_budget: 2000,
+                continuations_used: 3,
+                revision: 0,
+                created_at_ms: 9999, // must be IGNORED on conflict
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(got.status, "complete", "status must refresh");
+        assert_eq!(got.tokens_used, 550, "tokens must refresh");
+        assert_eq!(got.continuations_used, 3);
+        assert_eq!(got.objective, "compute 6x7");
+        assert_eq!(
+            got.created_at_ms, 1000,
+            "created_at must be preserved on conflict"
+        );
+
+        // Guard (issue #1957 codex #2): a STALE upsert — one whose
+        // `updated_at_ms` is OLDER than the row's — must NOT clobber the newer
+        // state. This is the finding-path-after-completion race: a peer finding
+        // lands and re-upserts the goal row with the goal's pre-completion
+        // status; without the `updated_at_ms >=` guard it would flip a
+        // `complete` goal back to `active` in the durable ledger.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "active".to_string(), // stale pre-completion status
+                tokens_used: 120,             // stale, lower spend
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1500, // OLDER than the row's 2000 → must be dropped
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            got.status, "complete",
+            "a stale (older updated_at_ms) upsert must not downgrade the status"
+        );
+        assert_eq!(
+            got.tokens_used, 550,
+            "a stale upsert must not roll the token counter backwards"
+        );
+        assert_eq!(
+            got.continuations_used, 3,
+            "stale continuations rejected too"
+        );
+
+        // #1965 codex round — the monotonic-counter clause, isolated from the
+        // complete-protection clause (fresh ACTIVE goal): two peers can finish
+        // in the SAME millisecond, so `updated_at_ms >=` alone admits the
+        // smaller charge upserting second and rolls the durable counter back
+        // while memory holds the higher total. tokens_used is MONOTONIC per
+        // goal_id (a replacement goal mints a fresh goal_id → different ledger
+        // file; re-activation never resets counters), so an equal-ms write
+        // carrying a LOWER tokens_used must be rejected...
+        let seed = |tokens_used: u64| Goal {
+            goal_id: "g2".to_string(),
+            objective: "concurrent peers".to_string(),
+            status: "active".to_string(),
+            tokens_used,
+            token_budget: 2000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 5000,
+            updated_at_ms: 5000, // every write in this block ties on ms
+        };
+        assert!(
+            ledger.upsert_goal(&seed(300)).unwrap(),
+            "the seeding insert is admitted"
+        );
+        // equal-ms, LOWER → rejected; #1973 fix-round: the rejection is now
+        // REPORTED (`false`) so an administrative status sync can detect the
+        // loss and retry with max'd counters instead of silently diverging.
+        assert!(
+            !ledger.upsert_goal(&seed(100)).unwrap(),
+            "a guarded rejection must report false"
+        );
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().tokens_used,
+            300,
+            "an equal-ms upsert with a lower tokens_used must not roll the \
+             counter backwards"
+        );
+        // ...while an equal-ms write carrying a HIGHER tokens_used (the other
+        // peer's larger charge landing second) must still be accepted.
+        assert!(
+            ledger.upsert_goal(&seed(450)).unwrap(),
+            "an admitted refresh must report true"
+        );
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().tokens_used,
+            450,
+            "an equal-ms upsert with a higher tokens_used must be accepted"
+        );
+    }
+
+    /// #1973 fix-round 3 — `cas_goal_status` flips ONLY the status of a row
+    /// still carrying the expected status; counters untouched; a mismatched
+    /// expectation or a `complete` row is a `false` no-op.
+    #[test]
+    fn cas_goal_status_updates_only_on_matching_expected_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "active".to_string(),
+                tokens_used: 300,
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+
+        // Matching (status, updated_at_ms) pair → status lands, counters
+        // untouched.
+        assert!(
+            ledger
+                .cas_goal_status("g1", "paused", "active", 1000, 2000)
+                .unwrap()
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "paused");
+        assert_eq!(row.updated_at_ms, 2000);
+        assert_eq!(row.tokens_used, 300, "the CAS never touches counters");
+        assert_eq!(row.continuations_used, 1);
+
+        // Stale status expectation (row moved on) → no-op.
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "cleared", "active", 2000, 3000)
+                .unwrap()
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "paused", "a lost CAS changes nothing");
+        assert_eq!(row.updated_at_ms, 2000);
+
+        // Stale TIMESTAMP expectation with a matching status: an interleaved
+        // write bumped the row after the read → the CAS must fail (round-4
+        // codex: predicating on status alone admitted this and could regress
+        // the row's clock).
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "cleared", "paused", 1234, 4000)
+                .unwrap()
+        );
+        assert_eq!(ledger.get_goal("g1").unwrap().unwrap().status, "paused");
+
+        // Missing goal → no-op.
+        assert!(
+            !ledger
+                .cas_goal_status("ghost", "paused", "active", 1000, 3000)
+                .unwrap()
+        );
+
+        // Complete is terminal: even a MATCHING expectation pair is refused.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g2".to_string(),
+                objective: "obj".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 10,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        assert!(
+            !ledger
+                .cas_goal_status("g2", "cleared", "complete", 1000, 5000)
+                .unwrap()
+        );
+        assert_eq!(ledger.get_goal("g2").unwrap().unwrap().status, "complete");
+    }
+
+    /// #1973 fix-round 4 — codex: an INTERVENING SAME-STATUS write between
+    /// the caller's read and its CAS must defeat the CAS. With a status-only
+    /// predicate, `active@1000` read → concurrent `active@3000/tok600` upsert
+    /// → CAS(expected active) still matched and stamped `cleared@2000`,
+    /// REGRESSING the row's clock (which then let a delayed `blocked@2500`
+    /// pass the ordering gate and flip cleared→blocked). Predicating on the
+    /// exact `(status, updated_at_ms)` pair read makes any interleaved write
+    /// change the pair → CAS fails → the newer state wins (one shot, no
+    /// re-attempt).
+    #[test]
+    fn cas_goal_status_is_defeated_by_an_intervening_same_status_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
+        let seed = |tokens_used: u64, updated_at_ms: u64| Goal {
+            goal_id: "g1".to_string(),
+            objective: "obj".to_string(),
+            status: "active".to_string(),
+            tokens_used,
+            token_budget: 2000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms,
+        };
+        ledger.upsert_goal(&seed(300, 1000)).unwrap();
+        // The caller reads (active, 1000)…
+        let read = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!((read.status.as_str(), read.updated_at_ms), ("active", 1000));
+        // …then a concurrent upsert lands the SAME status with newer fields.
+        assert!(ledger.upsert_goal(&seed(600, 3000)).unwrap());
+        // The CAS against the stale read must fail — and the newer row wins.
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "cleared", "active", 1000, 2000)
+                .unwrap(),
+            "an interleaved write must defeat the CAS",
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(row.updated_at_ms, 3000, "no clock regression");
+        assert_eq!(row.tokens_used, 600, "the newer counters survive");
+    }
+
+    #[test]
+    fn upsert_goal_never_downgrades_a_complete_goal() {
+        // Issue #1957 codex #2, defence-in-depth: the `updated_at_ms >=` guard
+        // alone cannot break a millisecond tie, and timestamps are only
+        // millisecond-resolution. A `complete` row is terminal for a goal_id
+        // (re-activation mints a fresh id), so a non-`complete` write must NEVER
+        // win against it — not even one carrying an equal or NEWER timestamp.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 500,
+                token_budget: 2000,
+                continuations_used: 2,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+
+        // EQUAL-ms stale `active` write (the tie the `>=` clause would admit):
+        // must be rejected by the complete-protection clause.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "active".to_string(),
+                tokens_used: 10,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000, // EQUAL to the stored row
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "complete",
+            "an equal-ms `active` write must not downgrade a `complete` goal"
+        );
+
+        // Even a strictly NEWER `active` write must not undo completion.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "active".to_string(),
+                tokens_used: 10,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 9999, // strictly newer
+            })
+            .unwrap();
+        let g1 = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            g1.status, "complete",
+            "even a newer `active` write must not downgrade a terminal `complete` goal"
+        );
+        assert_eq!(g1.tokens_used, 500, "counters stay at the completed values");
+
+        // A `complete → complete` refresh with a newer ts IS allowed.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 600,
+                token_budget: 2000,
+                continuations_used: 3,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 10_000,
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().tokens_used,
+            600,
+            "a complete→complete refresh with a newer ts still updates"
+        );
+
+        // `blocked` is NOT protected: a blocked goal is user-resumable to active
+        // under the same id, so a newer `active` write MUST win.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g2".to_string(),
+                objective: "obj2".to_string(),
+                status: "blocked".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g2".to_string(),
+                objective: "obj2".to_string(),
+                status: "active".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000, // newer → resume must win
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().status,
+            "active",
+            "a newer resume of a `blocked` goal must be allowed"
+        );
+    }
+
+    /// #1967 test helper — a minimal OPEN escalation row. The lifecycle tests
+    /// below vary only id/peer/timing/defaults, so keep the noise here.
+    fn open_escalation(
+        escalation_id: &str,
+        goal_id: &str,
+        peer_id: &str,
+        created_at_ms: u64,
+        default_action: Option<&str>,
+        default_after_secs: Option<i64>,
+    ) -> Escalation {
+        Escalation {
+            escalation_id: escalation_id.to_string(),
+            goal_id: goal_id.to_string(),
+            task_id: None,
+            peer_id: peer_id.to_string(),
+            question: format!("question from {peer_id}"),
+            context: None,
+            status: "open".to_string(),
+            default_action: default_action.map(str::to_string),
+            default_after_secs,
+            created_at_ms,
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        }
+    }
+
+    fn goal_row(goal_id: &str) -> Goal {
+        Goal {
+            goal_id: goal_id.to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        }
+    }
+
+    /// #1967 — the READ half of the escalation lifecycle. `append_escalation`
+    /// wrote rows and the resolve paths flipped them, but no production SELECT
+    /// existed: an open escalation was invisible. `list_open_escalations`
+    /// returns only this goal's OPEN rows, oldest first.
+    #[test]
+    fn list_open_escalations_returns_open_rows_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger.create_goal(&goal_row("g1")).unwrap();
+        ledger.create_goal(&goal_row("g2")).unwrap();
+        // Insert out of created order to prove the ORDER BY.
+        ledger
+            .append_escalation(&open_escalation("esc-b", "g1", "peer-b", 3000, None, None))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation("esc-a", "g1", "peer-a", 1000, None, None))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation("esc-c", "g1", "peer-c", 2000, None, None))
+            .unwrap();
+        // A different goal's row must not leak into g1's listing.
+        ledger
+            .append_escalation(&open_escalation("esc-x", "g2", "peer-x", 500, None, None))
+            .unwrap();
+        // A resolved row must not be listed as open.
+        ledger
+            .resolve_escalation("peer-c", "[answer] done", "master", 4000)
+            .unwrap();
+
+        let open = ledger.list_open_escalations("g1").unwrap();
+        assert_eq!(
+            open.iter()
+                .map(|e| e.escalation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["esc-a", "esc-b"],
+            "open-only, this goal only, oldest first"
+        );
+        assert_eq!(open[0].peer_id, "peer-a");
+        assert_eq!(open[0].question, "question from peer-a");
+    }
+
+    /// #1967 — `resolve_escalation_by_id` flips exactly the addressed row
+    /// (the peer_id-bulk `resolve_escalation` cannot target one of several
+    /// rows) and refuses an already-resolved or unknown id with `Ok(false)`.
+    #[test]
+    fn resolve_escalation_by_id_targets_one_row_and_refuses_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger.create_goal(&goal_row("g1")).unwrap();
+        // TWO open rows for the SAME peer — bulk resolve would flip both.
+        ledger
+            .append_escalation(&open_escalation("esc-1", "g1", "picker", 1000, None, None))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation("esc-2", "g1", "picker", 2000, None, None))
+            .unwrap();
+
+        let flipped = ledger
+            .resolve_escalation_by_id("esc-1", "[timeout] expired", "system:escalation-timeout")
+            .unwrap();
+        assert!(flipped, "an open row must resolve");
+        let open = ledger.list_open_escalations("g1").unwrap();
+        assert_eq!(open.len(), 1, "only the addressed row was flipped");
+        assert_eq!(open[0].escalation_id, "esc-2");
+
+        // Already resolved → refused (no clobber of the recorded resolution).
+        let again = ledger
+            .resolve_escalation_by_id("esc-1", "[answer] late", "master")
+            .unwrap();
+        assert!(!again, "a resolved row must not re-resolve");
+        // Unknown id → refused, not an error.
+        assert!(
+            !ledger
+                .resolve_escalation_by_id("esc-nope", "[timeout] expired", "system")
+                .unwrap()
+        );
+
+        // The FIRST resolve's text landed verbatim and survived the refused
+        // re-resolve (same raw-row check idiom as the #1961 test above).
+        let conn = ledger.conn.lock().unwrap();
+        let (status, resolution, resolved_by): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolution, resolved_by FROM escalations WHERE escalation_id = 'esc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "resolved");
+        assert_eq!(resolution.as_deref(), Some("[timeout] expired"));
+        assert_eq!(resolved_by.as_deref(), Some("system:escalation-timeout"));
+    }
+
+    /// #1967 — timeout candidates: only OPEN rows whose `default_after_secs`
+    /// has ELAPSED (`created_at_ms + s*1000 < now_ms`) qualify. Unexpired,
+    /// no-default, and already-resolved rows never surface.
+    #[test]
+    fn list_expired_open_escalations_filters_elapsed_defaults_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger.create_goal(&goal_row("g1")).unwrap();
+        // created 1000 + 10s → expires at 11_000: EXPIRED at now=60_000.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-expired",
+                "g1",
+                "p1",
+                1000,
+                Some("proceed"),
+                Some(10),
+            ))
+            .unwrap();
+        // created 1000 + 100s → expires at 101_000: NOT expired at now=60_000.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-later",
+                "g1",
+                "p2",
+                1000,
+                None,
+                Some(100),
+            ))
+            .unwrap();
+        // No default timer → never a candidate.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-forever",
+                "g1",
+                "p3",
+                1000,
+                None,
+                None,
+            ))
+            .unwrap();
+        // Expired timer but already resolved → never a candidate.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-done",
+                "g1",
+                "p4",
+                1000,
+                None,
+                Some(1),
+            ))
+            .unwrap();
+        ledger
+            .resolve_escalation("p4", "[answer] handled", "master", 5000)
+            .unwrap();
+
+        let candidates = ledger.list_expired_open_escalations(60_000).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|e| e.escalation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["esc-expired"],
+            "only the elapsed open default is a timeout candidate"
+        );
+        assert_eq!(candidates[0].default_action.as_deref(), Some("proceed"));
+        // At the exact boundary (created + s*1000 == now) the row is NOT yet
+        // expired — strict `<` matches the sweep's contract.
+        assert!(
+            ledger
+                .list_expired_open_escalations(11_000)
+                .unwrap()
+                .is_empty(),
+            "boundary instant is not yet expired"
+        );
+        assert_eq!(
+            ledger.list_expired_open_escalations(11_001).unwrap().len(),
+            1
+        );
     }
 }

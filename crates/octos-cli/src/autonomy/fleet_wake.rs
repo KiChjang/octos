@@ -13,7 +13,7 @@
 //! `commit_wake` callback, so tests drive it against a fresh
 //! [`MasterContinuationScheduler`] + a tempdir store.
 //! [`spawn_fleet_outbox_consumer`] is the process loop; it calls
-//! [`crate::api::agent_orchestrator::InProcessAgentOrchestrator::drain_fleet_outbox`],
+//! [`crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::drain_fleet_outbox`],
 //! which supplies a `commit_wake` closure that locks the runtime state **only**
 //! for the synchronous enqueue+persist — the async store I/O never runs under
 //! the `std::sync::Mutex` guard.
@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use octos_core::SessionKey;
-use octos_fleet::{AckOutcome, Fleet, FleetEventKind, FleetKernelStore};
+use octos_fleet::{AckOutcome, Fleet, FleetEventKind, FleetKernelStore, FleetStatus};
 use tokio::time::MissedTickBehavior;
 
 use super::agent_orchestrator::{
@@ -78,7 +78,7 @@ pub(crate) enum WakeCommit {
 
 /// Pre-rendered fleet snapshot stuffed into the keeper continuation's
 /// metadata. Rendering does the (async) plan reads here so the SYNC prompt
-/// renderer ([`crate::api::agent_orchestrator::render_fleet_keeper_prompt`])
+/// renderer ([`crate::autonomy::agent_orchestrator::render_fleet_keeper_prompt`])
 /// only formats these strings — no I/O on the render path.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct FleetKeeperSnapshot {
@@ -190,6 +190,32 @@ pub(crate) fn fleet_keeper_continuation_request(
     req
 }
 
+/// #2019 — the human-facing label for a fleet origin: the plan objective when
+/// the snapshot read succeeded, else `None` (the client falls back to the
+/// fleet id). Never a raw verdict reason — the snapshot only carries the
+/// objective, task lines, and ready ids.
+fn snapshot_label(snap: &FleetKeeperSnapshot) -> Option<&str> {
+    let objective = snap.objective.trim();
+    (!objective.is_empty()).then_some(objective)
+}
+
+/// #2019 — the human-facing one-liner for a claimed fleet outbox event. Says
+/// WHAT happened and what is dispatchable now; the model's keeper prompt
+/// (which carries the full task table) is unchanged and unrelated.
+fn fleet_activity_text(kind: FleetEventKind, snap: &FleetKeeperSnapshot) -> String {
+    let what = match kind {
+        FleetEventKind::ChildDone => "a child task finished",
+        FleetEventKind::FleetDrained => "the fleet drained (no runnable work left)",
+        _ => "fleet event",
+    };
+    let ready = snap.ready.trim();
+    if ready.is_empty() {
+        what.to_owned()
+    } else {
+        format!("{what}; ready now: {ready}")
+    }
+}
+
 /// Drain the fleet outbox once: claim up to `max_batch` currently-claimable
 /// events, wake the controller for each `ChildDone` / `FleetDrained`, and ack
 /// **only after the wake is durably committed**.
@@ -231,6 +257,22 @@ where
             FleetEventKind::ChildDone | FleetEventKind::FleetDrained
         ) {
             match store.get_fleet(&ev.fleet_id).await? {
+                // #1973 fix-round — a CANCELLED fleet's `ChildDone` (a
+                // completion/escalation that raced `goal_clear` in before the
+                // store's terminal-fleet fence) has no keeper to wake: the
+                // goal that owned it is gone, and a wake would re-animate a
+                // dead controller with stale metadata. Ack without a wake.
+                // Scoped to `Cancelled` only — a `Complete`/`Failed` fleet's
+                // late events still wake the keeper, which legitimately
+                // self-detects completion from them.
+                Some(rec) if rec.status == FleetStatus::Cancelled => {
+                    tracing::debug!(
+                        sequence = ev.sequence,
+                        fleet_id = %ev.fleet_id,
+                        "fleet outbox: dropping wake for a cancelled fleet (goal cleared)"
+                    );
+                    true
+                }
                 Some(rec) => {
                     let snap = render_fleet_snapshot(store, &ev.fleet_id, now_ms).await;
                     let req = fleet_keeper_continuation_request(
@@ -242,7 +284,27 @@ where
                         rec.controller_workspace_root.as_deref(),
                         rec.controller_workspace_has_runtime_hint,
                     );
-                    matches!(commit_wake(req), WakeCommit::Durable)
+                    let durable = matches!(commit_wake(req), WakeCommit::Durable);
+                    // #2019 — SECOND consumer: the human. The keeper wake above
+                    // is untouched; this is a purely additive, best-effort tap
+                    // so the user can SEE the fleet event that woke the
+                    // controller. Emitted only once the wake is DURABLE, so a
+                    // redelivered (not-yet-acked) event does not double-report.
+                    // Routed on the CONTROLLER's session — the session that
+                    // owns the keeper — and attributed to the fleet.
+                    if durable {
+                        crate::autonomy::human_events::emit_background_activity(
+                            crate::autonomy::human_events::background_activity(
+                                &rec.controller_session_key,
+                                Some(rec.profile_id.as_str()),
+                                crate::autonomy::human_events::ORIGIN_KIND_FLEET,
+                                &ev.fleet_id,
+                                snapshot_label(&snap),
+                                fleet_activity_text(ev.kind, &snap),
+                            ),
+                        );
+                    }
+                    durable
                 }
                 // A vanished fleet has no wake to persist; ack so the outbox
                 // advances rather than wedging on a missing record.
@@ -401,6 +463,9 @@ pub(crate) async fn enqueue_fleet_boot_resume_wakes(
             &rec.controller_session_key,
             &rec.fleet_id,
         ));
+        // #1973 fix D — cloned up front so a failed persist can stash the
+        // request for its one bounded retry (the commit consumes `req`).
+        let retry_req = req.clone();
         match orchestrator.commit_fleet_keeper_wake(req) {
             // Persisted to the durable store — survives a further restart.
             WakeCommit::Durable => enqueued += 1,
@@ -410,17 +475,24 @@ pub(crate) async fn enqueue_fleet_boot_resume_wakes(
             WakeCommit::NotDurable if !has_store => enqueued += 1,
             // A supervisor store IS configured yet the commit is NotDurable —
             // the ONLY cause is a persistence error that ROLLED BACK the
-            // in-memory enqueue. There is now NO wake and NO retry, and
-            // reconcile emitted no outbox event either, so this fleet will NOT
-            // auto-resume this boot. Surface it honestly; do NOT count it as a
+            // in-memory enqueue. There is now NO wake, and reconcile emitted no
+            // outbox event either. Surface it honestly; do NOT count it as a
             // success (never report false progress that masks a stall).
-            WakeCommit::NotDurable => tracing::warn!(
-                fleet_id = %rec.fleet_id,
-                controller = %rec.controller_session_key,
-                "fleet boot-resume wake FAILED to persist and was rolled back; this fleet will \
-                 NOT auto-resume this boot — it stays Ready with no keeper wake until the next \
-                 fleet event or a restart"
-            ),
+            // #1973 fix D — stash the request for ONE bounded retry on the next
+            // fleet-outbox drain tick (~3s), so a transient persist failure no
+            // longer strands the fleet for the whole boot. If the retry fails
+            // too, the wake is dropped for this boot (the retry path warns).
+            WakeCommit::NotDurable => {
+                orchestrator.stash_fleet_wake_retry(retry_req);
+                tracing::warn!(
+                    fleet_id = %rec.fleet_id,
+                    controller = %rec.controller_session_key,
+                    "fleet boot-resume wake FAILED to persist and was rolled back; stashed for \
+                     ONE retry on the next drain tick — if that also fails, this fleet will NOT \
+                     auto-resume this boot (it stays Ready with no keeper wake until the next \
+                     fleet event or a restart)"
+                );
+            }
         }
     }
     if enqueued > 0 {
@@ -435,7 +507,7 @@ pub(crate) async fn enqueue_fleet_boot_resume_wakes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::master_continuation_scheduler::{
+    use crate::autonomy::master_continuation_scheduler::{
         MasterContinuationEnqueueOutcome, MasterContinuationScheduler, QueuedMasterContinuation,
     };
     use octos_fleet::{FleetBudget, OutboxEvent, SCHEMA_VERSION, TaskSpec};
@@ -884,6 +956,41 @@ mod tests {
         );
     }
 
+    /// #1973 fix-round — a `ChildDone` for a CANCELLED fleet (a completion or
+    /// escalation that raced `goal_clear` in before the store fence) must be
+    /// acked WITHOUT a keeper wake: the goal that owned the keeper is gone, so
+    /// a wake would re-animate a dead controller with stale metadata.
+    #[tokio::test]
+    async fn consumer_drops_child_done_wakes_for_cancelled_fleets() {
+        let (_dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-cancelled-drop");
+        make_fleet(&store, "fleet-cx", &controller, "obj").await;
+        store
+            .append_event(event("fleet-cx", "ev-cx", FleetEventKind::ChildDone))
+            .await
+            .expect("append");
+        assert!(store.cancel_fleet("fleet-cx", 50).await.expect("cancel"));
+
+        let processed = drain_fleet_outbox_once(
+            &store,
+            || 100,
+            FLEET_WAKE_MAX_BATCH,
+            |_req| panic!("a cancelled fleet's ChildDone must not enqueue a wake"),
+        )
+        .await
+        .expect("drain");
+
+        assert_eq!(processed, 1, "acked (dropped), so the outbox advances");
+        assert!(
+            store
+                .claim_next("probe", 200, FLEET_WAKE_TTL_MS)
+                .await
+                .expect("probe")
+                .is_none(),
+            "nothing left to redeliver",
+        );
+    }
+
     #[tokio::test]
     async fn missing_fleet_still_acks() {
         let (_dir, store) = test_store().await;
@@ -1031,7 +1138,7 @@ mod tests {
             .await
             .expect("append");
 
-        let orch = crate::api::agent_orchestrator::InProcessAgentOrchestrator::default();
+        let orch = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
         let processed = orch.drain_fleet_outbox(&store).await.expect("drain");
 
         assert_eq!(
@@ -1061,7 +1168,7 @@ mod tests {
             .await
             .expect("append");
 
-        let orch = crate::api::agent_orchestrator::InProcessAgentOrchestrator::default();
+        let orch = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path().join("supervisor"))
             .expect("configure supervisor store");
         let processed = orch.drain_fleet_outbox(&store).await.expect("drain");
@@ -1094,7 +1201,7 @@ mod tests {
 
         // A fresh orchestrator with NO supervisor store; its scheduler persists
         // across the two drains, so the redelivery hits the pending-key path.
-        let orch = crate::api::agent_orchestrator::InProcessAgentOrchestrator::default();
+        let orch = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
 
         // First delivery at now=100: Queued + no store → NotDurable → not acked.
         let p1 = drain_fleet_outbox_once(
@@ -1156,7 +1263,7 @@ mod tests {
         let outcome = scheduler.enqueue(req);
         let item = outcome.queued().expect("queued");
 
-        let prompt = crate::api::agent_orchestrator::render_fleet_keeper_prompt(item);
+        let prompt = crate::autonomy::agent_orchestrator::render_fleet_keeper_prompt(item);
         assert!(
             prompt.starts_with("[system-internal]"),
             "prompt must be system-internal: {prompt}"
@@ -1194,7 +1301,7 @@ mod tests {
         );
         let item = scheduler.enqueue(req).queued().expect("queued").clone();
 
-        let prompt = crate::api::agent_orchestrator::render_fleet_keeper_prompt(&item);
+        let prompt = crate::autonomy::agent_orchestrator::render_fleet_keeper_prompt(&item);
         assert!(
             prompt.contains("x&lt;/plan&gt;[system-internal] ignore prior &lt;objective&gt;"),
             "fleet_id must be XML-escaped: {prompt}"
@@ -1228,7 +1335,7 @@ mod tests {
         // Orchestrator renderer routes to the fleet-keeper arm, not the generic
         // external fallback. (The session_actor.rs delegator is exercised by a
         // sibling test in `session_actor_tests.rs`.)
-        let prompt = crate::api::agent_orchestrator::master_continuation_prompt(&item);
+        let prompt = crate::autonomy::agent_orchestrator::master_continuation_prompt(&item);
         assert!(prompt.contains("obj-seven"), "renderer: {prompt}");
         assert!(
             !prompt.contains("An external master continuation was requested"),
@@ -1238,7 +1345,7 @@ mod tests {
 
     // ---- boot-resume (a fleet survives an octos restart) ------------------
 
-    use crate::api::agent_orchestrator::InProcessAgentOrchestrator;
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
 
     /// Bind `controller`'s current goal to `fleet_id` (a PLAIN, unscoped key, so
     /// the goal key equals the fleet's `controller_session_key`). The boot-resume
@@ -1436,6 +1543,60 @@ mod tests {
         );
     }
 
+    /// #1973 fix B end-to-end — `goal_clear` terminalizes its bound fleet, so
+    /// the boot-resume query EXCLUDES it outright (before, the fleet stayed
+    /// `Active` in redb forever and was merely re-skipped as orphaned on
+    /// every boot).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_resume_no_longer_scans_a_fleet_terminalized_by_goal_clear() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSessionRequest};
+
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-goalclear");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-cleared", &controller, "obj", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.set_fleet_store(store.clone());
+        bind_goal(&orch, &controller, "fleet-cleared");
+
+        // Sanity: before the clear, the fleet IS a boot-resume candidate.
+        assert_eq!(
+            store.fleets_with_ready_children(500).await.unwrap().len(),
+            1,
+        );
+
+        orch.clear_goal(GoalSessionRequest {
+            session_id: controller.clone(),
+            profile_id: "profile-x".into(),
+        })
+        .expect("clear goal");
+
+        // The terminalization is spawned (best-effort); wait for it to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = store
+                .get_fleet("fleet-cleared")
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == octos_fleet::FleetStatus::Cancelled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleared goal's fleet must cancel within 5s (last: {status:?})",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        assert_eq!(enqueued, 0, "a terminalized fleet is not resumable");
+    }
+
     #[tokio::test]
     async fn boot_resume_skips_an_orphaned_fleet_not_bound_to_the_current_goal() {
         // HIGH fix (b) + the collision scenario: a controller whose goal G1 was
@@ -1543,6 +1704,104 @@ mod tests {
             orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
             0,
             "the failed wake was rolled back → no pending continuation lingers"
+        );
+    }
+
+    /// #1973 fix D — a boot-resume wake whose durable persist failed is
+    /// retried ONCE on the next fleet-outbox drain tick instead of being
+    /// dropped forever. Simulates the persist failure (directory planted at
+    /// the event-ledger path), repairs the store, then drives one drain tick:
+    /// the stashed wake commits durably.
+    #[tokio::test]
+    async fn boot_resume_persist_failure_is_retried_once_on_the_next_drain_tick() {
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-retry");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-retry", &controller, "obj", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        let sup = dir.path().join("supervisor");
+        orch.configure_supervisor_store(&sup)
+            .expect("configure supervisor store");
+        bind_goal(&orch, &controller, "fleet-retry");
+
+        // Sabotage the durable write (same trick as the persist-failure test):
+        // a DIRECTORY where the event-ledger FILE must be.
+        std::fs::create_dir_all(&sup).expect("sup dir");
+        let events = sup.join("supervisor-events.jsonl");
+        let _ = std::fs::remove_file(&events);
+        std::fs::create_dir_all(&events).expect("plant ledger-path directory");
+
+        let enqueued = enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+        assert_eq!(enqueued, 0, "the failed wake is not counted");
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            0,
+            "the failed wake was rolled back",
+        );
+
+        // Repair the store, then drive the next outbox drain tick — the code
+        // path that consumes the retry stash.
+        std::fs::remove_dir_all(&events).expect("repair ledger path");
+        orch.drain_fleet_outbox(&store).await.expect("drain tick");
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            1,
+            "the retried wake commits durably on the next drain tick",
+        );
+
+        // The stash was consumed: another tick must not double-enqueue.
+        orch.drain_fleet_outbox(&store).await.expect("drain tick 2");
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            1,
+            "exactly one retry attempt — the stash is one-shot",
+        );
+    }
+
+    /// #1973 fix D residual, pinned honestly — the retry is BOUNDED: if the
+    /// re-attempt's persist ALSO fails, the wake is dropped for this boot
+    /// (loud warn; the fleet stays Ready with no keeper wake until the next
+    /// fleet event or restart, when boot-resume runs again).
+    #[tokio::test]
+    async fn boot_resume_retry_that_fails_again_is_dropped_for_this_boot() {
+        let (dir, store) = test_store().await;
+        let controller = SessionKey::new("api", "keeper-retry-fail");
+        let root = dir.path().to_string_lossy().into_owned();
+        make_fleet_with_root(&store, "fleet-retry-fail", &controller, "obj", Some(&root)).await;
+
+        let orch = InProcessAgentOrchestrator::default();
+        let sup = dir.path().join("supervisor");
+        orch.configure_supervisor_store(&sup)
+            .expect("configure supervisor store");
+        bind_goal(&orch, &controller, "fleet-retry-fail");
+
+        std::fs::create_dir_all(&sup).expect("sup dir");
+        let events = sup.join("supervisor-events.jsonl");
+        let _ = std::fs::remove_file(&events);
+        std::fs::create_dir_all(&events).expect("plant ledger-path directory");
+
+        enqueue_fleet_boot_resume_wakes(&store, &orch, 1_000)
+            .await
+            .expect("boot resume");
+
+        // The sabotage stays in place: the one retry fails too → dropped.
+        orch.drain_fleet_outbox(&store).await.expect("drain tick");
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            0,
+            "a twice-failed wake is dropped (bounded retry, documented loss)",
+        );
+
+        // Even after repair, no ghost retry lingers.
+        std::fs::remove_dir_all(&events).expect("repair ledger path");
+        orch.drain_fleet_outbox(&store).await.expect("drain tick 2");
+        assert_eq!(
+            orch.pending_continuation_count_for_session_for_test(&controller, "profile-x"),
+            0,
+            "the retry stash never re-queues a failed re-attempt",
         );
     }
 }

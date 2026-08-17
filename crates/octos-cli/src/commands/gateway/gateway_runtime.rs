@@ -132,7 +132,7 @@ async fn next_gateway_loop_event(
 
 // `discover_ominix_url` and `push_runtime_plugin_env` live in
 // `crate::skills_scope` so the `serve` plugin loader can reuse them.
-use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
+use crate::skills_scope::{discover_asr_url, discover_ominix_url, push_runtime_plugin_env};
 
 async fn apply_profile_runtime_contracts(
     profile: &UserProfile,
@@ -594,8 +594,9 @@ impl GatewayRuntime {
             .join("voice")
             .join("main");
         let ominix_url = discover_ominix_url();
+        let asr_url = discover_asr_url();
         let asr_binary =
-            if let Some(url) = ominix_url.as_deref().filter(|_| voice_binary_path.exists()) {
+            if let Some(url) = asr_url.as_deref().filter(|_| voice_binary_path.exists()) {
                 println!("{}: voice platform skill ({})", "Transcriber".green(), url);
                 println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
                 Some(voice_binary_path)
@@ -1428,6 +1429,10 @@ impl GatewayRuntime {
             plugin_require_signed: config.plugins.require_signed,
             llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
                 .unwrap_or_else(|_| llm_for_compaction.clone()),
+            // #1935 — the INDEPENDENT goal-completion verifier lane
+            // (`sub_providers` key `goal_verifier`); `None` ⇒ the sentinel
+            // accountant grades on the session's own provider (unchanged).
+            goal_verifier_llm: crate::runtime::profile::build_goal_verifier_provider(&config),
             task_query_store: task_query_store.clone(),
             subagent_output_router: subagent_output_router.clone(),
         };
@@ -1951,6 +1956,14 @@ impl GatewayRuntime {
                 &self.channel_mgr,
             )
             .await;
+            if media_result.rejected_audio_only {
+                info!(
+                    channel = %inbound.channel,
+                    chat_id = %inbound.chat_id,
+                    "ASR rejected audio-only inbound message; skipping agent dispatch"
+                );
+                continue;
+            }
             let image_media = media_result.image_media;
             let attachment_media = media_result.attachment_media;
             let attachment_prompt = media_result.attachment_prompt;

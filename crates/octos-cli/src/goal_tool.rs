@@ -20,14 +20,21 @@
 
 use async_trait::async_trait;
 use eyre::Result;
-use octos_agent::tools::{Tool, ToolContext, ToolResult};
+use octos_agent::tools::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 use octos_core::SessionKey;
 use octos_fleet::{
     AcceptanceCriterion, BASE_TOOLS, FsGrant, NetworkGrant, TaskSpec, Verifier, WorkerGrant,
 };
 use serde_json::{Value, json};
 
-use crate::api::agent_orchestrator::default_agent_orchestrator;
+use crate::autonomy::agent_orchestrator::{
+    AgentOrchestrator, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
+    MonitorListRequest, default_agent_orchestrator,
+};
+use crate::autonomy::monitor_runtime::{
+    MONITOR_DEFAULT_BATCH_MS, MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR, MONITOR_MIN_POLL_INTERVAL_SECS,
+    MonitorMode, MonitorSpec,
+};
 
 /// PR 5a — wall-clock milliseconds for a fleet op (create / dispatch). Matches
 /// the pool's own clock (`chrono::Utc::now().timestamp_millis()`), clamped
@@ -143,10 +150,15 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
 /// Wire shape:
 /// `{ "network": { "mode": "none"|"hosts"|"full", "hosts": ["example.com"] },
 ///    "tools": ["read_file", ..., "web_fetch"],
-///    "fs": "workspace"|"host" }`
+///    "fs": "workspace"|"host"
+///        | { "write": ["exemplar.card", "cards/*.card"], "create_only": true } }`
 ///
-/// `fs` is the coarse binary scope (v1 has no per-path allowlist — see
-/// [`parse_fs`]), NOT a `{read, write}` path object.
+/// `fs` is the coarse binary scope as a STRING, or (#1976) the per-path WRITE
+/// fence as an OBJECT: a workspace-relative allowlist of writable paths
+/// (`*`/`?` globs) with optional `create_only` (allowlisted paths may be
+/// created but never overwritten/edited). The object form always implies the
+/// workspace scope — reads stay workspace-wide, writes narrow to the list.
+/// See [`parse_fs`].
 fn parse_grant(value: Option<&Value>, task_id: &str) -> Result<WorkerGrant, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(WorkerGrant::minimal()),
@@ -181,11 +193,17 @@ fn parse_grant(value: Option<&Value>, task_id: &str) -> Result<WorkerGrant, Stri
     };
 
     let fs = match obj.get("fs") {
-        None | Some(Value::Null) => FsGrant::Workspace,
+        None | Some(Value::Null) => ParsedFs::default(),
         Some(fs) => parse_fs(fs, task_id)?,
     };
 
-    let grant = WorkerGrant { network, tools, fs };
+    let grant = WorkerGrant {
+        network,
+        tools,
+        fs: fs.scope,
+        write_paths: fs.write_paths,
+        create_only: fs.create_only,
+    };
     grant
         .validate()
         .map_err(|e| format!("task `{task_id}`: {e}"))?;
@@ -233,17 +251,83 @@ fn parse_network(value: &Value, task_id: &str) -> Result<NetworkGrant, String> {
     }
 }
 
-/// Parse the coarse `fs` scope — the string `"workspace"` (cwd-only, the
-/// default) or `"host"` (full daemon-user read+write). v1 is deliberately
-/// binary: the native tools have no per-path allowlist, so a narrow-paths grant
-/// is not offered here (it would falsely promise narrow but deliver host-wide).
-fn parse_fs(value: &Value, task_id: &str) -> Result<FsGrant, String> {
+/// The parsed `fs` lane of a grant: the coarse scope plus (#1976) the
+/// optional per-path write fence. Default = workspace scope, no fence —
+/// exactly the pre-#1976 behaviour for an absent `fs`.
+#[derive(Default)]
+struct ParsedFs {
+    scope: FsGrant,
+    write_paths: Option<Vec<String>>,
+    create_only: bool,
+}
+
+/// Parse the `fs` lane — either the coarse binary scope as a STRING
+/// (`"workspace"` cwd-only, the default; `"host"` full daemon-user
+/// read+write) or (#1976) the per-path WRITE fence as an OBJECT:
+/// `{ "write": ["exemplar.card", "cards/*.card"], "create_only": true }`.
+/// The object form always implies the workspace scope (a fence under `host`
+/// is incoherent — `WorkerGrant::validate` also rejects the programmatic
+/// combination); pattern syntax is validated there too (`*`/`?` globs,
+/// relative, no `..`). `write` is REQUIRED in the object form so `fs: {}`
+/// cannot silently mean "no fence".
+fn parse_fs(value: &Value, task_id: &str) -> Result<ParsedFs, String> {
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if key != "write" && key != "create_only" {
+                return Err(format!(
+                    "task `{task_id}`: unknown `grant.fs` key `{key}` (use `write` and \
+                     `create_only`)"
+                ));
+            }
+        }
+        let write_paths = match obj.get("write") {
+            Some(Value::Array(items)) => {
+                let mut paths = Vec::with_capacity(items.len());
+                for item in items {
+                    let pattern = item.as_str().map(str::trim).ok_or_else(|| {
+                        format!(
+                            "task `{task_id}`: each `grant.fs.write` entry must be a \
+                             workspace-relative path pattern"
+                        )
+                    })?;
+                    paths.push(pattern.to_owned());
+                }
+                paths
+            }
+            _ => {
+                return Err(format!(
+                    "task `{task_id}`: `grant.fs.write` (array of workspace-relative path \
+                     patterns) is required in the object form of `grant.fs`"
+                ));
+            }
+        };
+        let create_only = match obj.get("create_only") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                return Err(format!(
+                    "task `{task_id}`: `grant.fs.create_only` must be a boolean"
+                ));
+            }
+        };
+        return Ok(ParsedFs {
+            scope: FsGrant::Workspace,
+            write_paths: Some(write_paths),
+            create_only,
+        });
+    }
     let mode = value.as_str().map(str::trim).ok_or_else(|| {
-        format!("task `{task_id}`: `grant.fs` must be the string \"workspace\" or \"host\"")
+        format!(
+            "task `{task_id}`: `grant.fs` must be the string \"workspace\" or \"host\", or \
+             the per-path object {{\"write\": [...], \"create_only\": bool}}"
+        )
     })?;
     match mode.to_ascii_lowercase().as_str() {
-        "workspace" => Ok(FsGrant::Workspace),
-        "host" => Ok(FsGrant::Host),
+        "workspace" => Ok(ParsedFs::default()),
+        "host" => Ok(ParsedFs {
+            scope: FsGrant::Host,
+            ..ParsedFs::default()
+        }),
         other => Err(format!(
             "task `{task_id}`: unknown fs scope `{other}` (use \"workspace\" or \"host\")"
         )),
@@ -268,10 +352,12 @@ pub struct GoalGetTool {
     /// Peer-agent-based goal: the profile's persistent `data_dir`. When set,
     /// `goal_get` aggregates the latest `result.md` from every staged peer
     /// whose `goal` file points at the queried goal (under
-    /// `<data_dir>/peers/<slug>/goal`), AND the durable findings from the
-    /// goal's sqlite ledger (under `<data_dir>/goal-ledgers/<goal_id>.db`),
-    /// surfacing them as `peer_findings` and `ledger_findings` in the
-    /// snapshot. `None` preserves pre-peer-goal behaviour (no aggregation).
+    /// `<data_dir>/peers/<slug>/goal`), AND the durable findings + open
+    /// escalations from the goal's sqlite ledger (under
+    /// `<data_dir>/goal-ledgers/<goal_id>.db`), surfacing them as
+    /// `peer_findings`, `ledger_findings` and `open_escalations` (#1967) in
+    /// the snapshot. `None` preserves pre-peer-goal behaviour (no
+    /// aggregation).
     data_dir: Option<std::path::PathBuf>,
 }
 
@@ -379,7 +465,9 @@ impl Tool for GoalGetTool {
             // `Err` (H3) when `goal.fleet_id` doesn't belong to this goal — surface
             // it instead of reading/completing a foreign fleet.
             let fleet = match orchestrator
-                .model_fleet_snapshot(&session_id, &self.profile_id)
+                // #1964 — pass the profile data dir so a fleet terminal the
+                // snapshot backstop detects syncs the per-goal ledger (#1957).
+                .model_fleet_snapshot(&session_id, &self.profile_id, self.data_dir.as_deref())
                 .await
             {
                 Ok(fleet) => fleet,
@@ -427,6 +515,38 @@ impl Tool for GoalGetTool {
                     map.insert("ledger_findings".to_owned(), Value::Array(ledger_findings));
                 }
             }
+            // #1967 — fold in the goal's OPEN escalations (rows written when a
+            // goal-scoped peer parks on an approval/question). Until this read
+            // the escalations table was write-only: a master that missed the
+            // park-time wake could never rediscover a blocked peer from
+            // goal_get. Open rows only, compact shape (question ≤300 chars),
+            // omitted entirely when none are open.
+            let open_escalations =
+                orchestrator.model_goal_ledger_open_escalations(data_dir, &goal_id);
+            if !open_escalations.is_empty() {
+                if let Value::Object(map) = &mut snapshot {
+                    map.insert(
+                        "open_escalations".to_owned(),
+                        Value::Array(open_escalations),
+                    );
+                }
+            }
+            // #1945 — and the bounded ledger DIGEST, what a master
+            // re-orienting after a restart reads: fixed-size however large
+            // the goal grew, absent when the goal has no ledger file. Keys:
+            // `tasks` = counts by status over the ledger's FK stub rows —
+            // production only ever writes `running` stubs today and nothing
+            // updates them, so real counts read {"running": N} until a task-
+            // status writer lands; `findings.total`/`by_lifecycle`/`by_kind`
+            // = SQL aggregates over ALL findings, task-less rows included;
+            // `cost_tokens` sums the real per-finding charges (#1965) —
+            // Completed peer turns carry real usage; errored/interrupted
+            // turns under-charge 0 until #1969 lands.
+            if let Some(ledger_digest) = orchestrator.model_goal_ledger_digest(data_dir, &goal_id) {
+                if let Value::Object(map) = &mut snapshot {
+                    map.insert("ledger_digest".to_owned(), ledger_digest);
+                }
+            }
         }
         Ok(ToolResult {
             output: serde_json::to_string_pretty(&snapshot)
@@ -454,6 +574,15 @@ impl GoalPlanTool {
 impl Tool for GoalPlanTool {
     fn name(&self) -> &str {
         "goal_plan"
+    }
+
+    /// #1935 codex round 6 — goal_plan mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
     }
 
     fn description(&self) -> &str {
@@ -539,9 +668,26 @@ impl Tool for GoalPlanTool {
                                         "description": "The tools the worker may hold. Omit = the base file tools (read_file/write_file/edit_file/glob/grep/list_dir/shell). Add web_fetch/web_search (each REQUIRES a network grant)."
                                     },
                                     "fs": {
-                                        "type": "string",
-                                        "enum": ["workspace", "host"],
-                                        "description": "Filesystem reach. Omit = workspace (the worker's own scratch dir only, read+write). host = FULL daemon-user filesystem read+write (broad — grant only when a task genuinely needs host access). v1 is binary: narrow per-path grants are not yet supported."
+                                        "description": "Filesystem reach. Omit = workspace (the worker's own scratch dir only, read+write). String \"host\" = FULL daemon-user filesystem read+write (broad — grant only when a task genuinely needs host access). OBJECT = per-path WRITE fence (#1976): {\"write\": [\"exemplar.card\", \"cards/*.card\"], \"create_only\": true} — the worker may WRITE only the listed workspace-relative paths (globs: * and ? within one path segment; no **), everything else is read-only, kernel-enforced (file tools + shell sandbox). create_only additionally means listed paths may be CREATED but never overwritten/edited.",
+                                        "oneOf": [
+                                            { "type": "string", "enum": ["workspace", "host"] },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "write": {
+                                                        "type": "array",
+                                                        "items": { "type": "string" },
+                                                        "description": "Workspace-relative writable path patterns (* and ? globs). Everything else is read-only."
+                                                    },
+                                                    "create_only": {
+                                                        "type": "boolean",
+                                                        "description": "Listed paths may be created but never overwritten, edited, or deleted."
+                                                    }
+                                                },
+                                                "required": ["write"],
+                                                "additionalProperties": false
+                                            }
+                                        ]
                                     }
                                 },
                                 "additionalProperties": false
@@ -635,6 +781,15 @@ impl Tool for GoalDispatchTool {
         "goal_dispatch"
     }
 
+    /// #1935 codex round 6 — goal_dispatch mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn description(&self) -> &str {
         "Launch every currently-ready task of this goal's fleet onto background workers (call \
          goal_plan first to create the fleet). Ready = dependency-free or all deps succeeded. \
@@ -721,6 +876,15 @@ impl Tool for GoalGrantTool {
         "goal_grant"
     }
 
+    /// #1935 codex round 6 — goal_grant mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn description(&self) -> &str {
         "APPROVE a fleet worker's mid-task escalation: widen the blocked task's operator grant \
          and resume it (a fresh attempt re-runs with the new capability; its scratch dir \
@@ -753,7 +917,21 @@ impl Tool for GoalGrantTool {
                             "additionalProperties": false
                         },
                         "tools": { "type": "array", "items": { "type": "string" } },
-                        "fs": { "type": "string", "enum": ["workspace", "host"] }
+                        "fs": {
+                            "description": "\"workspace\" | \"host\", or the #1976 per-path write fence object {\"write\": [globs], \"create_only\": bool} (same shape as goal_plan's task grant).",
+                            "oneOf": [
+                                { "type": "string", "enum": ["workspace", "host"] },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "write": { "type": "array", "items": { "type": "string" } },
+                                        "create_only": { "type": "boolean" }
+                                    },
+                                    "required": ["write"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        }
                     },
                     "additionalProperties": false
                 }
@@ -845,13 +1023,25 @@ impl Tool for GoalGrantTool {
 /// PR B — `goal_deny`: REFUSE a worker's mid-task escalation, failing the task.
 pub struct GoalDenyTool {
     profile_id: String,
+    /// #1964 — profile's persistent data dir, so a deny that renders the fleet
+    /// un-completable syncs the goal-row status + a `decisions` row into
+    /// `<data_dir>/goal-ledgers/` (#1957). `None` on paths that never wired it
+    /// (the sync is then skipped).
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl GoalDenyTool {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            data_dir: None,
         }
+    }
+
+    /// #1964 — mirrors `GoalGetTool::with_data_dir` / `GoalUpdateTool::with_data_dir`.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
     }
 }
 
@@ -859,6 +1049,15 @@ impl GoalDenyTool {
 impl Tool for GoalDenyTool {
     fn name(&self) -> &str {
         "goal_deny"
+    }
+
+    /// #1935 codex round 6 — goal_deny mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
     }
 
     fn description(&self) -> &str {
@@ -938,6 +1137,8 @@ impl Tool for GoalDenyTool {
                 task_id,
                 reason,
                 fleet_now_ms(),
+                // #1964 — deny-driven goal terminals sync the per-goal ledger.
+                self.data_dir.as_deref(),
             )
             .await
         {
@@ -961,14 +1162,103 @@ impl Tool for GoalDenyTool {
 /// `goal_update` — model-owned terminal transitions ONLY.
 pub struct GoalUpdateTool {
     profile_id: String,
+    /// #1957 — profile's persistent data dir, so a transition can sync the
+    /// goal-row status + a `decisions` row into `<data_dir>/goal-ledgers/`.
+    /// `None` on paths that never wired it (the sync is then skipped).
+    data_dir: Option<std::path::PathBuf>,
+    /// #1935 — the INDEPENDENT verifier lane (profile `sub_providers` key
+    /// `goal_verifier`, resolved at profile build). When set, completion
+    /// claims are graded on THIS provider instead of the grading turn's own
+    /// `ctx.llm_provider`; `None` falls back to the turn provider — the
+    /// pre-#1935 behavior, kept as the back-compat default.
+    verifier_llm: Option<std::sync::Arc<dyn octos_llm::LlmProvider>>,
 }
 
 impl GoalUpdateTool {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            data_dir: None,
+            verifier_llm: None,
         }
     }
+
+    /// #1957 — set the profile data dir used to sync a transition to the ledger.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+
+    /// #1935 — route completion verification through the profile's dedicated
+    /// `goal_verifier` sub-provider lane instead of the turn's own provider.
+    pub fn with_verifier_provider(
+        mut self,
+        provider: std::sync::Arc<dyn octos_llm::LlmProvider>,
+    ) -> Self {
+        self.verifier_llm = Some(provider);
+        self
+    }
+}
+
+/// Max ledger findings folded into the completion evidence, and the per-finding
+/// assertion budget, so a large ledger cannot blow the verifier's input context.
+const MAX_LEDGER_EVIDENCE_FINDINGS: usize = 24;
+/// #2036 — raised from 600. A peer-recorded finding is a whole report, not one
+/// sentence, and at 600 the verifier was shown a fragment of every multi-defect
+/// audit and rejected completion on exactly that basis. Worst case is still
+/// bounded: 24 × 2000 ≈ 48K chars of evidence, and abridgement stays explicitly
+/// marked so the verifier can tell "abridged" from "corrupt".
+const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 2_000;
+
+/// Assemble the completion evidence the INDEPENDENT verifier judges.
+///
+/// The verifier grades whether the objective is met by "concrete evidence in
+/// the reply" ([`crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage`]).
+/// For a single-agent goal that reply IS the evidence. But in the PEER-GOAL
+/// model the concrete evidence is recorded by goal-scoped peers into the durable
+/// ledger, NOT re-typed into the master's completion reply — so a
+/// genuinely-complete goal (findings recorded, coverage proven) was rejected as
+/// "merely asserted" and the master looped retrying (observed live: 8 retries /
+/// 527K goal tokens before a human interrupt, with the verifier itself naming
+/// "no ledger content" as the gap). Folding the durable ledger findings into the
+/// evidence lets the verifier judge against what was actually recorded.
+///
+/// `ledger_findings` are the `{created_by, kind, assertion, ...}` objects from
+/// [`crate::autonomy::agent_orchestrator::AgentOrchestrator::model_goal_ledger_findings`].
+/// Empty (single-agent goals, or no ledger) returns the reason unchanged —
+/// exact pre-existing behavior.
+fn completion_evidence_with_ledger(reason: &str, ledger_findings: &[Value]) -> String {
+    if ledger_findings.is_empty() {
+        return reason.to_string();
+    }
+    let mut rendered = String::new();
+    for (i, f) in ledger_findings
+        .iter()
+        .take(MAX_LEDGER_EVIDENCE_FINDINGS)
+        .enumerate()
+    {
+        let by = f.get("created_by").and_then(Value::as_str).unwrap_or("?");
+        let kind = f.get("kind").and_then(Value::as_str).unwrap_or("finding");
+        let assertion = f.get("assertion").and_then(Value::as_str).unwrap_or("");
+        let assertion = octos_core::truncated_utf8(
+            assertion,
+            MAX_LEDGER_EVIDENCE_ASSERTION_CHARS,
+            " …[truncated]",
+        );
+        rendered.push_str(&format!("{}. [{by}] ({kind}) {assertion}\n", i + 1));
+    }
+    let extra = ledger_findings
+        .len()
+        .saturating_sub(MAX_LEDGER_EVIDENCE_FINDINGS);
+    if extra > 0 {
+        rendered.push_str(&format!(
+            "… (+{extra} more finding(s) recorded in the ledger)\n"
+        ));
+    }
+    format!(
+        "{reason}\n\n--- Durable goal-ledger findings (recorded by goal-scoped \
+peers/tasks; the authoritative evidence of the work performed) ---\n{rendered}"
+    )
 }
 
 #[async_trait]
@@ -1072,31 +1362,87 @@ impl Tool for GoalUpdateTool {
         // completion, we call run_goal_completion_verifier to independently check
         // the objective against the model's evidence. Blocked transitions skip
         // verification (they're failure declarations, not success claims).
+        //
+        // #1935 codex round 4 (A1) — this used to be the FOURTH verifier path
+        // still reading the objective and the goal id in SEPARATE lock
+        // acquisitions, re-reading the id after the await, and then
+        // transitioning unconditionally. It now takes the same one-lock
+        // `goal_verification_snapshot` as the three sentinel paths, grades
+        // `snapshot.objective`, and threads the snapshot INTO the guarded
+        // transition, which re-checks (id, objective, revision) under the
+        // mutation lock itself.
+        //
+        // #1935 codex round 5 — the verifier's spend is charged DIRECTLY to
+        // the goal here (the `allow_budget_limited` verifier-charge path),
+        // immediately after the verifier returns and BEFORE the transition,
+        // exactly once for BOTH verdicts. The former #1958 route — stamping
+        // `ToolResult.tokens_used` so the agent loop folds it into turn
+        // totals and the post-turn accountant charges the goal — was lost
+        // precisely when it succeeded: the tool completes the goal, and the
+        // post-turn charge is active-only, so it refused the now-complete
+        // goal and the stamped usage never landed. The stamp is REMOVED so
+        // no path double-charges (consumer trace: ToolResult.tokens_used →
+        // execute_tools aggregation → loop_runner `turn.record_usage` → turn
+        // totals → the post-turn goal charge; the sentinel paths' verifier
+        // calls never rode turn totals either, so goal accounting is now
+        // uniform across all four verifier sites — the only trade-off is the
+        // TURN cost display no longer counts this one out-of-band call).
+        let mut verified_snapshot: Option<
+            crate::autonomy::agent_orchestrator::GoalVerificationSnapshot,
+        > = None;
         if status == "complete" {
             let orchestrator = default_agent_orchestrator();
-            let Some(objective) = orchestrator.goal_objective_for_test(&session_id) else {
+            let Some(snapshot) =
+                orchestrator.goal_verification_snapshot(&session_id, &self.profile_id)
+            else {
                 return Ok(ToolResult {
                     output: "goal_update: no goal objective found for verification".into(),
                     success: false,
                     ..Default::default()
                 });
             };
-            // Snapshot goal_id BEFORE the async verifier call to prevent
-            // completing the wrong goal if it changes during the await.
-            let expected_goal_id = orchestrator.goal_id_for_session(&session_id);
-            // The evidence is the model's reason for claiming completion.
-            let verdict = crate::api::agent_orchestrator::run_goal_completion_verifier(
-                ctx.llm_provider.clone(),
-                &objective,
-                reason,
-            )
-            .await;
+            // #1935 — grade on the INDEPENDENT verifier lane when the profile
+            // configures one; otherwise the turn's own provider (unchanged
+            // pre-#1935 behavior). The evidence is the model's reason for
+            // claiming completion.
+            let verifier_provider = self
+                .verifier_llm
+                .clone()
+                .unwrap_or_else(|| ctx.llm_provider.clone());
+            // In the peer-goal model the concrete completion evidence lives in
+            // the durable ledger (goal-scoped peers record findings there), not
+            // in the master's reply. Fold those findings into the evidence so the
+            // reply-only verifier can confirm a genuinely-complete goal instead
+            // of looping on "no ledger content". Empty ledger (single-agent goal,
+            // or no data_dir wired) → reason unchanged.
+            let ledger_findings = self
+                .data_dir
+                .as_ref()
+                .map(|dd| orchestrator.model_goal_ledger_findings(dd, &snapshot.goal_id))
+                .unwrap_or_default();
+            let evidence = completion_evidence_with_ledger(reason, &ledger_findings);
+            let (verdict, usage) =
+                crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
+                    verifier_provider,
+                    &snapshot.objective,
+                    &evidence,
+                )
+                .await;
+            // #1935 round 5 — exactly-once direct charge, while the goal is
+            // still active/budget_limited (a `complete` goal cannot be
+            // charged). Covers Done AND NotDone outcomes.
+            let _ = orchestrator.charge_goal_verifier_usage(
+                &session_id,
+                &self.profile_id,
+                Some(&snapshot.goal_id),
+                &usage,
+            );
             if !verdict.is_done() {
                 return Ok(ToolResult {
                     output: format!(
                         "goal_update: completion NOT verified — independent verifier returned: {}",
                         match verdict {
-                            crate::api::goal_loop_runtime::GoalCompletionVerdict::NotDone {
+                            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone {
                                 reason,
                             } => reason,
                             _ => "unknown".to_string(),
@@ -1106,27 +1452,26 @@ impl Tool for GoalUpdateTool {
                     ..Default::default()
                 });
             }
-            // Verifier confirmed Done, but we must still revalidate goal identity
-            // to prevent stale verdicts (goal changed during the await).
-            let current_goal_id = orchestrator.goal_id_for_session(&session_id);
-            if expected_goal_id != current_goal_id {
-                return Ok(ToolResult {
-                    output: format!(
-                        "goal_update: goal changed during verification (was {:?}, now {:?}) — stale verdict rejected",
-                        expected_goal_id, current_goal_id
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+            // The stale-verdict recheck happens INSIDE the guarded transition
+            // below, under the same lock that mutates — no racy re-read here.
+            verified_snapshot = Some(snapshot);
         }
 
-        match default_agent_orchestrator().model_transition_goal(
-            &session_id,
-            &self.profile_id,
-            status,
-            reason,
-        ) {
+        // #1957 — pass the profile data dir so the transition syncs into the
+        // ledger (goals-row status + a decision) using the snapshot it just
+        // transitioned. Done INSIDE the transition (not here) so it uses the
+        // correct goal without a racy re-fetch (codex #3).
+        match default_agent_orchestrator()
+            .model_transition_goal_guarded(
+                &session_id,
+                &self.profile_id,
+                status,
+                reason,
+                verified_snapshot.as_ref(),
+                self.data_dir.as_deref(),
+            )
+            .await
+        {
             Ok(goal) => Ok(ToolResult {
                 output: format!(
                     "goal transitioned to `{status}`:\n{}",
@@ -1163,6 +1508,18 @@ impl GoalCreateTool {
 impl Tool for GoalCreateTool {
     fn name(&self) -> &str {
         "goal_create"
+    }
+
+    /// #1935 codex round 7 — goal_create's admission ("no unfinished goal
+    /// exists") spans a check in `model_create_goal` and the create inside
+    /// `set_goal`, re-locking between them; two creates in one parallel batch
+    /// both passed the check and the loser overwrote the winner's objective.
+    /// The admission is now ALSO enforced atomically inside `set_goal`
+    /// (actor == "model" refuses the update branch for an unfinished goal),
+    /// and this override is the batch-level defense-in-depth, matching the
+    /// fleet-mutating family below.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
     }
 
     fn description(&self) -> &str {
@@ -1267,9 +1624,1090 @@ impl Tool for GoalCreateTool {
     }
 }
 
+/// #1977 — `monitor_create`: arm a zero-token background event watcher. A
+/// monitor is a cheap probe subprocess (sanitized env, host-user authority,
+/// NOT confined by a sandbox backend — a tracked follow-up) whose FILTERED
+/// output lines wake this session's master turn — the model runs ONLY when an
+/// event appears, unlike `/loop` which burns a full turn every tick.
+/// Keeper-gated (peers cannot arm monitors) exactly like the `goal_plan`
+/// family.
+pub struct MonitorCreateTool {
+    profile_id: String,
+    data_dir: Option<std::path::PathBuf>,
+}
+
+impl MonitorCreateTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+            data_dir: None,
+        }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for MonitorCreateTool {
+    fn name(&self) -> &str {
+        "monitor_create"
+    }
+
+    /// Monitor creation mutates the process-global monitor registry and is
+    /// admission-checked against a per-session quota; serialize the family
+    /// like the goal-mutating tools so a parallel batch can't race the quota.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
+    fn description(&self) -> &str {
+        // Truthfulness (codex round blocker 5): the probe runs a keeper-provided
+        // command with sanitized env (BLOCKED_ENV_VARS + credential-looking
+        // names stripped) and HOST-USER authority in the profile data dir. It
+        // is NOT confined by a sandbox backend (bwrap / sandbox-exec) — full
+        // sandbox-backend confinement of the probe is a tracked follow-up
+        // (#1977 residual). Do not describe it as "sandboxed".
+        "Arm a ZERO-TOKEN background monitor: a cheap probe process whose FILTERED output lines \
+         wake you ONLY when something changes — no model tokens are spent while it is quiet. \
+         Use this instead of a /loop when you want \"wake me WHEN Y happens\" rather than \
+         \"do X every N\" (e.g. watch a sqlite row, tail a log for an error line, poll a status \
+         endpoint). `argv` is the probe command, run as a subprocess with sanitized environment \
+         (secret and injection env vars stripped) and your host-user authority in the profile \
+         data dir — it is NOT confined by a sandbox backend, so only run commands you would run \
+         yourself. In poll mode (default) argv runs every `interval_seconds` and you are woken \
+         when its FILTERED output CHANGES; in stream mode argv runs once and every filtered \
+         stdout line is an event. `filter_regex` keeps only matching lines. A monitor that \
+         floods (more than `max_events_per_hour`) auto-pauses with a durable note. \
+         Non-persistent monitors expire after `timeout_secs`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Short human-readable label." },
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The probe command as an argument vector (no shell). e.g. [\"sqlite3\", \"state.db\", \"select status from job\"]."
+                },
+                "filter_regex": {
+                    "type": "string",
+                    "description": "Optional regex; only stdout lines matching it count as events. Omit to match every non-empty line."
+                },
+                "mode": { "type": "string", "enum": ["poll", "stream"], "description": "poll (default): re-run argv on an interval, wake on CHANGE. stream: follow argv's stdout line-by-line." },
+                "interval_seconds": { "type": "integer", "description": "Poll cadence in seconds (poll mode; default 1)." },
+                "timeout_secs": { "type": "integer", "description": "Auto-expire after this many seconds unless persistent." },
+                "persistent": { "type": "boolean", "description": "Never auto-expire (still never survives a server restart as a process; its spec re-arms)." },
+                "max_events_per_hour": { "type": "integer", "description": "Flood cap; over this the monitor auto-pauses (default 60)." }
+            },
+            "required": ["name", "argv"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "monitor_create: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        // Keeper-gated: a peer must not arm monitors that would wake the
+        // master on its behalf — the master owns its own event watchers.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "monitor_create: peers cannot arm monitors — only the master session \
+                         can. Report what you would watch to the master instead."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let argv: Vec<String> = match args.get("argv").and_then(Value::as_array) {
+            Some(items) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            None => Vec::new(),
+        };
+        let filter_regex = args
+            .get("filter_regex")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        // Unknown mode is rejected (blocker 6), not silently coerced to poll.
+        // The schema enum already constrains the model; this is defense in
+        // depth for a direct/unchecked call.
+        let mode = match args.get("mode").and_then(Value::as_str).map(str::trim) {
+            None | Some("") | Some("poll") => MonitorMode::Poll {
+                interval_secs: args
+                    .get("interval_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(MONITOR_MIN_POLL_INTERVAL_SECS),
+            },
+            Some("stream") => MonitorMode::Stream,
+            Some(other) => {
+                return Ok(ToolResult {
+                    output: format!(
+                        "monitor_create: unknown mode `{other}` (use `poll` or `stream`)"
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+        let spec = MonitorSpec {
+            name,
+            argv,
+            filter_regex,
+            batch_ms: MONITOR_DEFAULT_BATCH_MS,
+            mode,
+            timeout_secs: args.get("timeout_secs").and_then(Value::as_u64),
+            persistent: args
+                .get("persistent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            max_events_per_hour: args
+                .get("max_events_per_hour")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR),
+            goal_id: ctx.goal_id.clone(),
+            // Default probe cwd: the profile data dir (ToolContext carries no
+            // workspace root). NOT a sandbox boundary — the probe runs at
+            // host-user authority; the model may pass absolute paths in argv
+            // when it must reach a specific file.
+            cwd: self.data_dir.clone(),
+        };
+        match default_agent_orchestrator().create_monitor(MonitorCreateRequest {
+            session_id,
+            profile_id: self.profile_id.clone(),
+            spec,
+            data_dir: self.data_dir.clone(),
+        }) {
+            Ok(value) => Ok(ToolResult {
+                output: format!(
+                    "monitor created:\n{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(err) => Ok(ToolResult {
+                output: format!("monitor_create: {}", err.message),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// #1977 — `monitor_list`: read the current session's armed monitors.
+pub struct MonitorListTool {
+    profile_id: String,
+}
+
+impl MonitorListTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MonitorListTool {
+    fn name(&self) -> &str {
+        "monitor_list"
+    }
+
+    fn description(&self) -> &str {
+        "List the monitors armed for this session, with their status (active / paused / \
+         expired), mode, and why a paused monitor paused (e.g. flooded)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, _args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "monitor_list: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        // Keeper-gated (codex round blocker 5): monitors belong to the master.
+        // Fence a peer out of even enumerating them, matching monitor_create /
+        // monitor_delete — so the whole family is peer-fenced, not just the
+        // mutators.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "monitor_list: peers cannot manage the master's monitors.".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        match default_agent_orchestrator().list_monitors(MonitorListRequest {
+            session_id: Some(session_id),
+            profile_id: self.profile_id.clone(),
+        }) {
+            Ok(value) => Ok(ToolResult {
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                success: true,
+                ..Default::default()
+            }),
+            Err(err) => Ok(ToolResult {
+                output: format!("monitor_list: {}", err.message),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// #1977 — `monitor_delete`: disarm a monitor by id. Keeper-gated.
+pub struct MonitorDeleteTool {
+    profile_id: String,
+}
+
+impl MonitorDeleteTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MonitorDeleteTool {
+    fn name(&self) -> &str {
+        "monitor_delete"
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
+    fn description(&self) -> &str {
+        "Disarm a monitor by its `monitor_id` (from monitor_list). Its watcher process is \
+         torn down. Use this when a watch is no longer needed."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "monitor_id": { "type": "string", "description": "The monitor to disarm (from monitor_list)." }
+            },
+            "required": ["monitor_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "monitor_delete: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "monitor_delete: peers cannot manage the master's monitors.".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let Some(monitor_id) = args
+            .get("monitor_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "monitor_delete: `monitor_id` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        match default_agent_orchestrator().control_monitor(MonitorControlRequest {
+            monitor_id: monitor_id.to_owned(),
+            session_id: Some(session_id),
+            profile_id: self.profile_id.clone(),
+            kind: MonitorControlKind::Delete,
+        }) {
+            Ok(value) => Ok(ToolResult {
+                output: format!(
+                    "monitor deleted:\n{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(err) => Ok(ToolResult {
+                output: format!("monitor_delete: {}", err.message),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1935 — a call-counting scripted provider for verifier-lane routing
+    /// assertions: replies with a fixed verdict line and fixed token usage.
+    struct CountingVerifierProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reply: &'static str,
+        usage: octos_llm::TokenUsage,
+    }
+
+    #[async_trait]
+    impl octos_llm::LlmProvider for CountingVerifierProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.reply.to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: self.usage.clone(),
+                provider_index: Some(0),
+            })
+        }
+        fn model_id(&self) -> &str {
+            "counting-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "counting-verifier"
+        }
+    }
+
+    /// Captures the Debug of the messages the verifier is called with, so a
+    /// test can assert exactly what evidence reached the independent verifier.
+    struct CapturingVerifierProvider {
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
+        reply: &'static str,
+    }
+
+    #[async_trait]
+    impl octos_llm::LlmProvider for CapturingVerifierProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            *self.captured.lock().unwrap() = format!("{messages:?}");
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.reply.to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: Some(0),
+            })
+        }
+        fn model_id(&self) -> &str {
+            "capturing-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "capturing-verifier"
+        }
+    }
+
+    #[test]
+    fn completion_evidence_folds_ledger_findings_into_the_reply() {
+        let findings = vec![
+            json!({"created_by":"peer:audit-auth","kind":"observation","assertion":"PLANTED_AUTH hardcoded credential DB_PASSWORD at src/auth.py:2"}),
+            json!({"created_by":"peer:audit-parse","kind":"observation","assertion":"PLANTED_PARSE off-by-one buf[len(buf)] at src/parse.py:3"}),
+        ];
+        let evidence =
+            completion_evidence_with_ledger("both files audited; findings recorded", &findings);
+        // the master's own reply is preserved
+        assert!(
+            evidence.contains("both files audited"),
+            "reply preserved: {evidence}"
+        );
+        // AND the concrete ledger evidence the reply-only verifier previously missed
+        assert!(
+            evidence.contains("PLANTED_AUTH"),
+            "auth finding must reach the verifier: {evidence}"
+        );
+        assert!(
+            evidence.contains("PLANTED_PARSE"),
+            "parse finding must reach the verifier: {evidence}"
+        );
+        assert!(
+            evidence.contains("peer:audit-auth"),
+            "finding author attributed: {evidence}"
+        );
+    }
+
+    #[test]
+    fn completion_evidence_is_reply_only_when_ledger_empty() {
+        // back-compat: single-agent goals (no ledger findings) unchanged.
+        assert_eq!(
+            completion_evidence_with_ledger("done: X and Y verified", &[]),
+            "done: X and Y verified",
+        );
+    }
+
+    #[test]
+    fn completion_evidence_bounds_a_large_ledger() {
+        let findings: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({"created_by":"peer:x","kind":"observation","assertion":format!("finding number {i}")})
+            })
+            .collect();
+        let evidence = completion_evidence_with_ledger("all done", &findings);
+        assert!(evidence.contains("finding number 0"));
+        assert!(
+            !evidence.contains("finding number 30"),
+            "must not dump all 100 findings: {evidence}"
+        );
+        assert!(
+            evidence.contains("+76 more"),
+            "the capped remainder is noted: {evidence}"
+        );
+    }
+
+    #[test]
+    fn completion_evidence_truncates_a_giant_assertion() {
+        let big = "Z".repeat(50_000);
+        let findings = vec![json!({"created_by":"peer:x","kind":"observation","assertion":big})];
+        let evidence = completion_evidence_with_ledger("done", &findings);
+        assert!(
+            evidence.len() < MAX_LEDGER_EVIDENCE_ASSERTION_CHARS + 500,
+            "a giant assertion is bounded: len={}",
+            evidence.len()
+        );
+        assert!(
+            evidence.contains("…[truncated]"),
+            "abridgement must be MARKED, so the verifier reads it as abridged \
+             rather than as corrupt evidence: {evidence}"
+        );
+    }
+
+    /// #2036 — a peer's multi-finding report must reach the verifier WHOLE.
+    ///
+    /// This is the shape that failed live: two peers audited a file each and
+    /// reported a table of defects. At the old 600-char budget the verifier saw
+    /// the first row and a cut-off second, and rejected completion six times on
+    /// exactly that basis ("only ~2 of the 7 claimed findings are actually
+    /// verifiable") until the master gave up and marked the goal `blocked` —
+    /// even though every finding was real and correctly recorded.
+    #[test]
+    fn completion_evidence_keeps_a_realistic_peer_report_intact() {
+        let mut report = String::from("[completed] Audit of auth.py — 4 defects found:\n");
+        for (severity, defect, remediation) in [
+            (
+                "CRITICAL",
+                "hardcoded live admin token in source (line 3): ADMIN_TOKEN is a \
+                 real credential committed to the repository and readable by \
+                 anyone with source access",
+                "rotate the token immediately and load it from the environment",
+            ),
+            (
+                "CRITICAL",
+                "check_pin off-by-one (lines 8-11): the loop bound is \
+                 len(expected) - 1, so the final digit is never compared and \
+                 \"123X\" authenticates against \"1234\" for any X",
+                "iterate the full range and compare with a constant-time helper",
+            ),
+            (
+                "HIGH",
+                "no length check (lines 6-11): a short entry raises IndexError \
+                 out of the comparison loop, and a longer-than-expected entry is \
+                 silently accepted because only the shared prefix is examined",
+                "reject a mismatched length before comparing",
+            ),
+            (
+                "MEDIUM",
+                "non-constant-time comparison (lines 9-10, 15): both the PIN loop \
+                 and the token equality short-circuit on first mismatch, leaking \
+                 the shared prefix length through timing",
+                "use hmac.compare_digest for both",
+            ),
+        ] {
+            report.push_str(&format!("| {severity} | {defect} | fix: {remediation} |\n"));
+        }
+        report.push_str("Totals: 2 critical, 1 high, 1 medium.");
+        assert!(
+            report.chars().count() > 600,
+            "the fixture must exceed the OLD budget or it proves nothing"
+        );
+
+        let findings =
+            vec![json!({"created_by":"peer:aud-auth","kind":"observation","assertion":report})];
+        let evidence = completion_evidence_with_ledger("both peers reported", &findings);
+
+        assert!(
+            evidence.contains("hardcoded live admin token"),
+            "the first defect must survive: {evidence}"
+        );
+        assert!(
+            evidence.contains("hmac.compare_digest"),
+            "the LAST defect must survive too — truncation used to drop it: {evidence}"
+        );
+        assert!(
+            evidence.contains("Totals: 2 critical"),
+            "the report's own summary must survive: {evidence}"
+        );
+        assert!(
+            !evidence.contains("…[truncated]"),
+            "an ordinary peer report must not be abridged at all: {evidence}"
+        );
+    }
+
+    /// The peer-goal convergence fix (soaked live 2026-08-12): `goal_update`
+    /// completion must fold the DURABLE ledger findings into the evidence the
+    /// independent verifier judges — not only the master's reply. Without this a
+    /// genuinely-complete peer goal (findings recorded, coverage proven) is
+    /// rejected as "merely asserted" and the master loops. Proven here by
+    /// capturing the exact prompt the verifier receives.
+    #[tokio::test]
+    async fn goal_update_folds_ledger_findings_into_verifier_evidence() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("ledger-evidence-prof:api:goal-update-ledger".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "ledger-evidence-prof".to_owned(),
+                objective: "audit every file under src/ and record findings".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session)
+            .expect("goal id minted");
+
+        // Seed the goal's DURABLE ledger with a peer finding whose assertion is a
+        // distinctive marker the master's reply does NOT contain.
+        let data_dir = tempfile::tempdir().unwrap();
+        let ledger_dir = data_dir.path().join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger =
+            octos_fleet::GoalLedger::open(ledger_dir.join(format!("{goal_id}.db"))).unwrap();
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "audit every file under src/ and record findings".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        ledger
+            .append_finding(&octos_fleet::Finding {
+                rowid: None,
+                finding_id: "f-1".to_owned(),
+                seq: 1,
+                task_id: None,
+                goal_id: goal_id.clone(),
+                kind: "observation".to_owned(),
+                lifecycle: "observed".to_owned(),
+                confidence: "high".to_owned(),
+                review_state: "unreviewed".to_owned(),
+                assertion: "PLANTED_LEDGER_EVIDENCE off-by-one over-read at src/parse.py:3"
+                    .to_owned(),
+                evidence: None,
+                config_version: None,
+                derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 0,
+                created_at_ms: 1_000,
+                created_by: "peer:audit-parse".to_owned(),
+            })
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let verifier = std::sync::Arc::new(CapturingVerifierProvider {
+            captured: captured.clone(),
+            reply: "DONE",
+        });
+
+        let tool = GoalUpdateTool::new("ledger-evidence-prof")
+            .with_data_dir(data_dir.path().to_path_buf())
+            .with_verifier_provider(verifier);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &json!({
+                    "status": "complete",
+                    "reason": "Both files under src/ audited; findings recorded in the ledger."
+                }),
+            )
+            .await
+            .expect("goal_update runs");
+        assert!(result.success, "verified completion: {}", result.output);
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(
+            prompt.contains("PLANTED_LEDGER_EVIDENCE"),
+            "the durable ledger finding must reach the independent verifier's evidence; prompt was:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Both files under src/ audited"),
+            "the master's own reply is also present: {prompt}"
+        );
+    }
+
+    /// #1935 — when the profile configures a `goal_verifier` sub-provider
+    /// lane, `goal_update(status="complete")` must run the INDEPENDENT
+    /// completion verifier on THAT lane, never on the grading turn's own
+    /// provider (`ctx.llm_provider`), and the verifier's token usage must
+    /// still be stamped on the ToolResult (#1958).
+    #[tokio::test]
+    async fn goal_update_routes_verifier_through_configured_lane() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        // Process-global orchestrator: unique key, never cleared (same idiom
+        // as the sibling goal_get tests).
+        let session = SessionKey("verifier-lane-prof:api:goal-update-lane".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-lane-prof".to_owned(),
+                objective: "route the verifier through the lane".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let lane_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lane_provider = std::sync::Arc::new(CountingVerifierProvider {
+            calls: lane_calls.clone(),
+            reply: "DONE",
+            usage: octos_llm::TokenUsage {
+                input_tokens: 40,
+                output_tokens: 2,
+                ..Default::default()
+            },
+        });
+        let turn_provider = std::sync::Arc::new(CountingVerifierProvider {
+            calls: turn_calls.clone(),
+            // If the tool wrongly grades on the turn provider, the verdict
+            // flips NotDone and the assertions below fail loudly.
+            reply: "NOT_DONE: wrong lane",
+            usage: octos_llm::TokenUsage::default(),
+        });
+
+        let tool = GoalUpdateTool::new("verifier-lane-prof").with_verifier_provider(lane_provider);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+        ctx.llm_provider = turn_provider;
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "did it"}))
+            .await
+            .expect("goal_update runs");
+        assert!(result.success, "verified completion: {}", result.output);
+        assert_eq!(
+            lane_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured verifier lane grades the completion",
+        );
+        assert_eq!(
+            turn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the grading turn's own provider must NOT be consulted",
+        );
+        // #1935 round 5 — the verifier spend lands DIRECTLY on the GOAL
+        // (charged before the completion flip), not on the ToolResult stamp:
+        // the stamped route was rejected by the active-only post-turn charge
+        // exactly when the tool succeeded (the goal is complete by then).
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 42,
+            "verifier input+output charged to the goal before the flip",
+        );
+        assert!(
+            result.tokens_used.is_none(),
+            "the #1958 stamp is removed — the direct charge is the only route",
+        );
+    }
+
+    /// #1935 back-compat — without a configured lane the tool falls back to
+    /// the turn's own provider (`ctx.llm_provider`), the pre-#1935 behavior.
+    #[tokio::test]
+    async fn goal_update_verifier_falls_back_to_turn_provider_when_lane_unconfigured() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("verifier-fallback-prof:api:goal-update-fallback".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-fallback-prof".to_owned(),
+                objective: "fall back to the turn provider".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let turn_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn_provider = std::sync::Arc::new(CountingVerifierProvider {
+            calls: turn_calls.clone(),
+            reply: "DONE",
+            usage: octos_llm::TokenUsage {
+                input_tokens: 7,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        });
+
+        let tool = GoalUpdateTool::new("verifier-fallback-prof");
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+        ctx.llm_provider = turn_provider;
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "done"}))
+            .await
+            .expect("goal_update runs");
+        assert!(result.success, "verified completion: {}", result.output);
+        assert_eq!(
+            turn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unconfigured lane ⇒ the turn's provider grades (unchanged behavior)",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 8, "verifier spend (7+1) charged to the goal");
+    }
+
+    /// #1935 codex round 5 — a NotDone refusal also charges the verifier's
+    /// spend to the goal exactly ONCE, directly (the removed ToolResult stamp
+    /// would have ridden the turn totals into a SECOND charge on the still-
+    /// active goal). Asserts the GOAL counter, not the ToolResult.
+    #[tokio::test]
+    async fn goal_update_notdone_refusal_charges_verifier_usage_once() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("verifier-notdone-prof:api:goal-update-notdone".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-notdone-prof".to_owned(),
+                objective: "refuse but charge once".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier = std::sync::Arc::new(CountingVerifierProvider {
+            calls: calls.clone(),
+            reply: "NOT_DONE: evidence missing",
+            usage: octos_llm::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 8,
+                ..Default::default()
+            },
+        });
+        let tool = GoalUpdateTool::new("verifier-notdone-prof").with_verifier_provider(verifier);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "not yet"}))
+            .await
+            .expect("goal_update runs");
+        assert!(!result.success, "NotDone verdict refuses the transition");
+        assert!(result.tokens_used.is_none(), "no stamp on refusal either");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 28,
+            "the refused verifier call is still real spend, charged exactly once",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session).as_deref(),
+            Some("active"),
+            "the goal stays active after the refusal",
+        );
+    }
+
+    /// #1935 codex round 6 — the fleet-mutating goal tools must not run in a
+    /// parallel batch: their snapshot→await→commit windows interleave (the
+    /// goal_plan double-bind was the observed instance). `goal_update` stays
+    /// Safe deliberately — its transition is CAS-guarded by the revision
+    /// snapshot, so a concurrent loser gets a clean stale-verdict error.
+    #[test]
+    fn goal_fleet_tools_are_concurrency_exclusive() {
+        assert_eq!(
+            GoalPlanTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        assert_eq!(
+            GoalDispatchTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        assert_eq!(
+            GoalGrantTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        assert_eq!(
+            GoalDenyTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        // #1935 round 7 — goal_create's admission spans two lock scopes; the
+        // batch must serialize it (plus the atomic set_goal guard).
+        assert_eq!(
+            GoalCreateTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        // goal_get stays Safe NOT because it is read-only — its fleet
+        // snapshot carries the lazy backstop terminalization — but because
+        // that backstop drives `drive_goal_terminal_transition` with the
+        // in-hand fleet id, and `model_transition_goal_at_key` re-verifies
+        // the binding (`expected_fleet_id`) UNDER the state lock immediately
+        // before the flip (#1865 review FIX 2), so concurrent goal_get calls
+        // cannot terminalize a re-planned goal on stale evidence.
+        assert_eq!(
+            GoalGetTool::new("p").concurrency_class(),
+            ConcurrencyClass::Safe
+        );
+        // goal_update stays Safe: its transition is CAS-guarded by the
+        // revision snapshot, so a concurrent loser fails cleanly.
+        assert_eq!(
+            GoalUpdateTool::new("p").concurrency_class(),
+            ConcurrencyClass::Safe
+        );
+    }
+
+    /// #1967 — `goal_get` must SURFACE open escalations: the rows are written
+    /// when a goal-scoped peer parks (`model_goal_record_peer_escalation`) but
+    /// until this fold no production read existed, so the master model could
+    /// never see them. Same data_dir gate as `ledger_findings`.
+    #[tokio::test]
+    async fn goal_get_includes_open_escalations_when_data_dir_set() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        // The tool reads the PROCESS-GLOBAL orchestrator: use a unique
+        // session/profile and never clear the shared state (sibling tests own
+        // their own keys — same idiom as the ui_protocol continuation tests).
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("esc-tenant:api:goal-get-open-escalations".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "esc-tenant".to_owned(),
+                objective: "surface open escalations".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session)
+            .expect("goal id minted");
+
+        // Seed the goal's ledger with ONE open escalation (goal ids are
+        // `goal_NN` — already filename-safe).
+        let data_dir = tempfile::tempdir().unwrap();
+        let ledger_dir = data_dir.path().join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger =
+            octos_fleet::GoalLedger::open(ledger_dir.join(format!("{goal_id}.db"))).unwrap();
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "surface open escalations".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        ledger
+            .append_escalation(&octos_fleet::Escalation {
+                escalation_id: "esc-helper-1".to_owned(),
+                goal_id: goal_id.clone(),
+                task_id: None,
+                peer_id: "helper".to_owned(),
+                question: "[question] which port?".to_owned(),
+                context: None,
+                status: "open".to_owned(),
+                default_action: None,
+                default_after_secs: None,
+                created_at_ms: 1_000,
+                resolved_at_ms: None,
+                resolved_by: None,
+                resolution: None,
+            })
+            .unwrap();
+
+        let tool = GoalGetTool::new("esc-tenant").with_data_dir(data_dir.path().to_path_buf());
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+        let result = tool
+            .execute_with_context(&ctx, &json!({}))
+            .await
+            .expect("goal_get runs");
+        assert!(result.success, "goal_get succeeds: {}", result.output);
+        let snapshot: Value = serde_json::from_str(&result.output).expect("json snapshot");
+        let escalations = snapshot["open_escalations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("open_escalations folded in, got: {snapshot}"));
+        assert_eq!(escalations.len(), 1);
+        assert_eq!(escalations[0]["escalation_id"], json!("esc-helper-1"));
+        assert_eq!(escalations[0]["peer_id"], json!("helper"));
+        assert_eq!(escalations[0]["question"], json!("[question] which port?"));
+        assert!(
+            escalations[0]["age_seconds"].as_u64().is_some(),
+            "age_seconds present"
+        );
+    }
+
+    /// #1945 — `goal_get` folds the compact `ledger_digest` (next to the
+    /// `ledger_findings` row dump) when constructed with a data dir, so a
+    /// master re-orienting after a restart reads bounded counts, never a
+    /// view that grows with the goal. codex round — the ledger is seeded
+    /// through the REAL production writer (`model_goal_record_peer_finding`),
+    /// so the assertions state what production actually produces: a `running`
+    /// task stub (nothing updates task status today) and — now that #1965
+    /// charges real tokens — a cost total that includes the task-less row
+    /// the old path-digest roll-up dropped.
+    #[tokio::test]
+    async fn goal_get_folds_ledger_digest_when_constructed_with_data_dir() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+
+        let orchestrator = default_agent_orchestrator();
+        // Unique wire id: the default orchestrator is process-global.
+        let wire = "digest-prof:local:goal-digest-tool";
+        let session = SessionKey(wire.to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "digest-prof".into(),
+                objective: "prove the ledger_digest fold".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session)
+            .expect("goal id for session");
+
+        // Seed the ledger through the production write path: one finding
+        // staged with a fleet task (creates the `running` FK stub row) that
+        // charges 700 tokens (#1965), one WITHOUT a task_id (the common
+        // peer_handoff case — the row the old path-digest cost roll-up
+        // dropped) charging 0.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "digest-prof",
+                wire,
+                "peer-alpha",
+                Some("t1"),
+                "it works",
+                700,
+            )
+            .expect("task-scoped finding recorded");
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "digest-prof",
+                wire,
+                "peer-beta",
+                None,
+                "task-less, still counted",
+                0,
+            )
+            .expect("task-less finding recorded");
+
+        let tool = GoalGetTool::new("digest-prof").with_data_dir(data_dir.path().to_path_buf());
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(wire.to_owned());
+        let result = tool
+            .execute_with_context(&ctx, &json!({}))
+            .await
+            .expect("goal_get executes");
+        assert!(result.success, "goal_get failed: {}", result.output);
+        let snapshot: Value = serde_json::from_str(&result.output).expect("json snapshot");
+        let digest = snapshot
+            .get("ledger_digest")
+            .expect("ledger_digest folded into the goal snapshot");
+        assert_eq!(digest["tasks"], json!({"running": 1}));
+        assert_eq!(digest["findings"]["total"], json!(2));
+        assert_eq!(digest["findings"]["by_lifecycle"], json!({"observed": 2}));
+        assert_eq!(digest["findings"]["by_kind"], json!({"observation": 2}));
+        assert_eq!(
+            digest["cost_tokens"],
+            json!(700),
+            "digest sums the real #1965 per-finding charges"
+        );
+        // The row-dump sibling still rides along — digest summarizes, it does
+        // not replace.
+        assert!(
+            snapshot.get("ledger_findings").is_some(),
+            "ledger_findings must remain next to ledger_digest"
+        );
+    }
 
     #[test]
     fn goal_plan_absent_grant_is_minimal() {
@@ -1316,6 +2754,102 @@ mod tests {
         let specs = parse_task_specs(&full).expect("parses");
         assert_eq!(specs[0].grant.network, NetworkGrant::Full);
         assert_eq!(specs[0].grant.fs, FsGrant::Workspace);
+    }
+
+    #[test]
+    fn goal_plan_parses_per_path_write_grant() {
+        // #1976 — the object form of `fs` expresses a per-path WRITE fence:
+        // `{ "write": [globs], "create_only": bool }`. The fs scope stays
+        // Workspace (a fence is only coherent there) and the allowlist +
+        // create_only land on the grant verbatim.
+        let args = json!({
+            "tasks": [ {
+                "task_id": "refine",
+                "title": "refine the exemplar",
+                "grant": {
+                    "fs": { "write": ["exemplar.card", "cards/*.card"], "create_only": true }
+                }
+            } ]
+        });
+        let specs = parse_task_specs(&args).expect("parses");
+        let grant = &specs[0].grant;
+        assert_eq!(grant.fs, FsGrant::Workspace);
+        assert_eq!(
+            grant.write_paths,
+            Some(vec![
+                "exemplar.card".to_string(),
+                "cards/*.card".to_string()
+            ]),
+        );
+        assert!(grant.create_only);
+        // Omitted create_only defaults false; entries are trimmed.
+        let plain = json!({
+            "tasks": [ {
+                "task_id": "t",
+                "title": "t",
+                "grant": { "fs": { "write": ["  out.txt  "] } }
+            } ]
+        });
+        let specs = parse_task_specs(&plain).expect("parses");
+        assert_eq!(
+            specs[0].grant.write_paths,
+            Some(vec!["out.txt".to_string()])
+        );
+        assert!(!specs[0].grant.create_only);
+    }
+
+    #[test]
+    fn goal_plan_rejects_malformed_per_path_write_grant() {
+        // #1976 — parse/validation failures surface as plan-time errors, so
+        // an inexpressible fence can never reach the store: traversal,
+        // absolute paths, create_only-with-nothing, unknown keys, and
+        // non-boolean create_only are all named in the error.
+        let cases: [(Value, &str); 6] = [
+            (json!({ "write": ["../escape"] }), "fs.write"),
+            (json!({ "write": ["/etc/passwd"] }), "fs.write"),
+            (json!({ "write": [], "create_only": true }), "create_only"),
+            (json!({ "create_only": true }), "write"),
+            (json!({ "write": ["ok.txt"], "surprise": 1 }), "surprise"),
+            (
+                json!({ "write": ["ok.txt"], "create_only": "yes" }),
+                "create_only",
+            ),
+        ];
+        for (fs, needle) in cases {
+            let args = json!({
+                "tasks": [ {
+                    "task_id": "t1",
+                    "title": "do it",
+                    "grant": { "fs": fs }
+                } ]
+            });
+            let err = parse_task_specs(&args).expect_err("malformed fence rejected");
+            assert!(
+                err.contains(needle),
+                "error for fs={} must mention `{needle}`: {err}",
+                args["tasks"][0]["grant"]["fs"],
+            );
+        }
+    }
+
+    #[test]
+    fn goal_plan_rejects_per_path_write_grant_with_host_fs() {
+        // #1976 — the object form always implies workspace scope; a fence
+        // cannot be combined with `host` (there is no syntax for it: `fs` is
+        // ONE field), and the fleet-side validate() also rejects the
+        // programmatic combination. Assert the parse-level story: `host`
+        // still parses as the binary grant with NO fence.
+        let args = json!({
+            "tasks": [ {
+                "task_id": "t1",
+                "title": "do it",
+                "grant": { "fs": "host" }
+            } ]
+        });
+        let specs = parse_task_specs(&args).expect("binary host grant parses");
+        assert_eq!(specs[0].grant.fs, FsGrant::Host);
+        assert_eq!(specs[0].grant.write_paths, None);
+        assert!(!specs[0].grant.create_only);
     }
 
     #[test]

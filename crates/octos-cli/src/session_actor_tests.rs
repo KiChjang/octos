@@ -2137,6 +2137,7 @@ async fn setup_actor_with_mode(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -2214,6 +2215,7 @@ async fn build_unspawned_actor(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     }
 }
 
@@ -2421,6 +2423,7 @@ async fn setup_actor_with_timeout(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -2439,13 +2442,31 @@ async fn master_continuation_tick_reenters_actor_loop() {
         setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
     let session_id = test_session_key(dir.path());
 
-    crate::api::agent_orchestrator::default_agent_orchestrator().upsert_agent(
-        crate::api::agent_orchestrator::AgentUpsert {
-            agent_id: "child-a".into(),
+    // #2029: the orchestrator's agent registry is process-global and keyed by
+    // `agent_id` ALONE — the session is a field on the record, not part of the
+    // key. Eighteen tests hardcode `child-a`, so a sibling running concurrently
+    // overwrites this record's session_id/status, the tick finds no completed
+    // child for THIS session, and the assertion below fails. It passed under
+    // `--test-threads=1` and under the narrow CI filters, and failed in roughly
+    // one full parallel run in three.
+    //
+    // Uniqueness is unilateral: a unique id cannot be clobbered no matter what
+    // the other seventeen do. Derived from the TempDir name, which is already
+    // what makes `session_id` unique here.
+    let agent_id = format!(
+        "child-a-{}",
+        dir.path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
+        crate::autonomy::agent_orchestrator::AgentUpsert {
+            agent_id: agent_id.clone(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
             task_id: None,
-            path: "master/child-a".into(),
+            path: format!("master/{agent_id}"),
             role: "worker".into(),
             nickname: "Ada".into(),
             backend_kind: "native".into(),
@@ -2522,7 +2543,7 @@ async fn master_continuation_tick_reenters_actor_loop() {
 #[cfg(feature = "api")]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation() {
-    use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
 
     let dir = tempfile::TempDir::new().unwrap();
     // `make_response` carries TokenUsage { input: 50, output: 10 } —
@@ -2617,7 +2638,7 @@ async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation
 #[cfg(feature = "api")]
 #[test]
 fn session_actor_continuation_prompt_matches_canonical_renderer() {
-    use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
 
     let orchestrator = default_agent_orchestrator();
     let session_id = SessionKey::with_profile("tenant-c", "api", "goalfix-render");
@@ -2663,7 +2684,7 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
     );
 
     orchestrator
-        .clear_goal(crate::api::agent_orchestrator::GoalSessionRequest {
+        .clear_goal(crate::autonomy::agent_orchestrator::GoalSessionRequest {
             session_id: session_id.clone(),
             profile_id: "tenant-c".into(),
         })
@@ -2674,13 +2695,13 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
 /// `agent_orchestrator::master_continuation_prompt`) must route a fleet-keeper
 /// wake to the fleet-keeper arm, not the generic external fallback. This is the
 /// gateway-path half of the "both renderers" guard (its orchestrator-path twin
-/// lives in `api::fleet_wake`); it also proves the objective is XML-escaped
+/// lives in `autonomy::fleet_wake`); it also proves the objective is XML-escaped
 /// across the delegation.
 #[cfg(feature = "api")]
 #[test]
 fn session_actor_renders_fleet_keeper_prompt() {
-    use crate::api::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
-    use crate::api::master_continuation_scheduler::MasterContinuationScheduler;
+    use crate::autonomy::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
+    use crate::autonomy::master_continuation_scheduler::MasterContinuationScheduler;
 
     let snap = FleetKeeperSnapshot {
         objective: "keeper via <gateway>".to_owned(),
@@ -2798,6 +2819,7 @@ async fn test_session_actor_emits_resume_and_turn_end_hooks() {
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -2933,6 +2955,7 @@ async fn test_forced_background_turn_emits_turn_end_hook() {
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -3062,6 +3085,7 @@ async fn setup_actor_for_cron_regression(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -3166,6 +3190,7 @@ async fn setup_speculative_actor(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -3267,6 +3292,7 @@ async fn setup_speculative_actor_with_indicator(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -5739,6 +5765,7 @@ async fn setup_dispatch_registry(
         llm: provider.clone(),
         llm_for_compaction: provider.clone(),
         llm_strong: provider.clone(),
+        goal_verifier_llm: None,
         memory,
         memory_inject_tokens: 2500,
         memory_refresh_enabled: true,
@@ -8783,6 +8810,7 @@ async fn setup_actor_with_approval_provider(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
         usage_ledger: None,
         session_usage: Default::default(),
         usage_profile_id: "test-profile".to_string(),

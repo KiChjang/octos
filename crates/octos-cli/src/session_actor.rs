@@ -51,15 +51,11 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "api")]
-#[cfg(feature = "api")]
-use crate::api::agent_orchestrator::{
-    default_agent_orchestrator, run_goal_completion_verifier, upsert_background_task_agent,
+use crate::autonomy::agent_orchestrator::{
+    default_agent_orchestrator, run_goal_completion_verifier_with_usage,
+    upsert_background_task_agent,
 };
-#[cfg(feature = "api")]
-use crate::api::goal_loop_runtime::GoalCompletionVerdict;
-#[cfg(feature = "api")]
-use crate::api::master_continuation_scheduler::{
+use crate::autonomy::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
 };
 use crate::config::QueueMode;
@@ -132,6 +128,23 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
+
+/// #2003 — how often a running turn re-stamps its in-flight marker, gated on
+/// the turn actually producing tokens. Comfortably under
+/// `IN_FLIGHT_STALE_AFTER_MS` (30 min) so a producing turn is never a single
+/// missed beat away from being judged abandoned, while being far too coarse to
+/// matter for contention.
+const IN_FLIGHT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Abort a spawned task when this guard drops, so a helper task cannot outlive
+/// the turn that owns it on ANY exit path (return, error, cancellation).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Bound actor inbox send/ack waits for background terminal delivery.
 const BACKGROUND_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -356,7 +369,7 @@ fn context_manager_status_value(manager: &ContextManager) -> serde_json::Value {
 
 fn publish_context_manager_status(session_key: &SessionKey, manager: &ContextManager) {
     #[cfg(feature = "api")]
-    crate::api::ui_protocol::update_session_context_status(
+    crate::api::ui_protocol_transport::update_session_context_status(
         session_key,
         context_manager_status_value(manager),
     );
@@ -540,7 +553,7 @@ fn record_prompt_messages_not_covered_by_context(
             continue;
         }
         // Mirror of the same exemption in
-        // `api::ui_protocol::record_prompt_messages_not_covered_by_context`:
+        // `api::ui_protocol_transport::record_prompt_messages_not_covered_by_context`:
         // skip System messages. The agent's runtime System prompt is
         // re-composed on every turn and prepended fresh to
         // `messages[0]`; recording it here makes the manager stack one
@@ -720,7 +733,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
 
         // Capture runtime System once per turn at TurnStart, reuse on
         // every Iteration. See the AppUI analogue in
-        // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+        // `api::ui_protocol_transport::AppUiPromptContextBridge::prepare_prompt`
         // for the duplication concern that motivates the cache.
         if request.phase == PromptContextPhase::TurnStart {
             scratch.runtime_system = messages
@@ -744,7 +757,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             // multi-System payloads produced here would reach the
             // provider unmerged. Anthropic in particular rejects them
             // outright. See the AppUI analogue in
-            // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // `api::ui_protocol_transport::AppUiPromptContextBridge::prepare_prompt`
             // for the rationale.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
@@ -1745,7 +1758,6 @@ fn forward_task_status_to_actor_inbox(
     // `upsert_background_task_agent` resolves the right profile here; the
     // AppUI/serve bare-key path threads its runtime profile explicitly
     // (see `forward_task_progress_to_channel`).
-    #[cfg(feature = "api")]
     let _ = upsert_background_task_agent(task, None);
 
     let task_json = sanitize_task_for_response(data_dir, task);
@@ -2802,6 +2814,12 @@ pub struct ActorFactory {
     pub llm_for_compaction: Arc<dyn LlmProvider>,
     /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
     pub llm_strong: Arc<dyn LlmProvider>,
+    /// #1935 — the INDEPENDENT goal-completion verifier lane (profile
+    /// `sub_providers` key `goal_verifier`, resolved at factory build via
+    /// `crate::runtime::profile::build_goal_verifier_provider`). `None` ⇒
+    /// the sentinel accountant grades on the session's own provider — the
+    /// pre-#1935 behavior, kept as the back-compat default.
+    pub goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
     pub memory: Arc<EpisodeStore>,
     pub system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     pub hooks: Option<Arc<HookExecutor>>,
@@ -3348,9 +3366,8 @@ impl ActorFactory {
         // Gateway session keys carry the profile (`profile:channel:chat`), so
         // `None` lets the key-derived profile resolve inside the router —
         // matching `forward_task_status_to_actor_inbox`'s `None` call.
-        #[cfg(feature = "api")]
         supervisor.set_on_terminal(move |event| {
-            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 None,
                 // Gateway: failure recovery stays on the `RecoveryHint` inbox
@@ -3361,7 +3378,7 @@ impl ActorFactory {
                 // collapses against the legacy on_change ChildCompleted via
                 // the step-3 dedupe key). Step 4 retires RecoveryHint and
                 // flips this to `Queue`.
-                crate::api::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
+                crate::autonomy::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
             );
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
@@ -4003,6 +4020,7 @@ impl ActorFactory {
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
             last_turn_total_tokens: 0,
+            goal_verifier_llm: self.goal_verifier_llm.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -4326,7 +4344,6 @@ pub(crate) fn format_failover_push(event: &FailoverEvent) -> String {
     )
 }
 
-#[cfg(feature = "api")]
 fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
     match reason {
         MasterContinuationReason::ChildCompleted => "child_completed",
@@ -4339,7 +4356,7 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
 }
 
 /// Canonicalized (codex HIGH): delegate to the single renderer in
-/// [`crate::api::agent_orchestrator::master_continuation_prompt`] so both
+/// [`crate::autonomy::agent_orchestrator::master_continuation_prompt`] so both
 /// continuation-render paths — the AppUI / WS path and this SessionActor
 /// gateway path — emit byte-identical prompts.
 ///
@@ -4350,9 +4367,8 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
 /// canonical renderer closes by escaping and fencing the objective and
 /// dropping it from the raw metadata. Forwarding eliminates the drift and
 /// prevents it from recurring (the two renderers can no longer diverge).
-#[cfg(feature = "api")]
 fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
-    crate::api::agent_orchestrator::master_continuation_prompt(continuation)
+    crate::autonomy::agent_orchestrator::master_continuation_prompt(continuation)
 }
 
 // ── SessionActor ────────────────────────────────────────────────────────────
@@ -4493,6 +4509,12 @@ struct SessionActor {
     /// (which let a goal recur past its token budget). Reset to 0 at the top
     /// of each turn so a failed/no-response turn charges nothing.
     last_turn_total_tokens: u64,
+
+    /// #1935 — the INDEPENDENT goal-completion verifier lane, threaded from
+    /// [`ActorFactory::goal_verifier_llm`]. Read by the goal accountant
+    /// (`maybe_advance_goal_runtime_after_turn`), which — like the rest of
+    /// the goal machinery in [`crate::autonomy`] — compiles unconditionally.
+    goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
 }
 
 impl SessionActor {
@@ -4886,7 +4908,6 @@ impl SessionActor {
         }
     }
 
-    #[cfg(feature = "api")]
     fn synthetic_master_continuation_inbound(
         &self,
         continuation: &QueuedMasterContinuation,
@@ -4915,7 +4936,6 @@ impl SessionActor {
         }
     }
 
-    #[cfg(feature = "api")]
     async fn drain_master_continuations(&mut self) -> bool {
         let runtime_state = if self.active_overflow_tasks.load(Ordering::Acquire) > 0 {
             MasterContinuationRuntimeState::busy()
@@ -5078,7 +5098,6 @@ impl SessionActor {
     /// response's input+output tokens — the same per-turn total the AppUI
     /// dispatch path attributes). Passing 0 here previously let the token
     /// budget gate never trip, so a goal recurred past its token budget.
-    #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
         profile_id: &str,
@@ -5087,12 +5106,20 @@ impl SessionActor {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
         let tokens_consumed = self.last_turn_total_tokens;
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(
+        if let Some(snapshot) = orchestrator.record_goal_turn(
             &self.session_key,
             profile_id,
             tokens_consumed,
             elapsed_seconds,
-        );
+        ) {
+            // #1982 — reconcile the durable ledger after a mid-turn completion so
+            // its `tokens_used` reflects the goal's true final cost.
+            orchestrator.reconcile_terminal_goal_ledger(
+                &self.session_key,
+                &snapshot,
+                &self.data_dir,
+            );
+        }
         // Capture the most recent assistant turn's text content to feed
         // the completion-sentinel detector. Reading from the durable
         // session handle keeps the wiring narrow — `process_inbound`
@@ -5109,52 +5136,78 @@ impl SessionActor {
                 .unwrap_or_default()
         };
         // Loop-engineering completion gate: only spend the INDEPENDENT
-        // verifier LLM call when the agent actually CLAIMS completion.
-        let (verdict, expected_goal_id) = if orchestrator.goal_completion_claimed(&assistant_tail) {
-            let objective = orchestrator
-                .goal_objective_for_test(&self.session_key)
-                .unwrap_or_else(|| "unknown".to_string());
-            // Snapshot goal_id BEFORE the async verifier call to prevent
-            // completing the wrong goal if it changes during the await.
-            let goal_id = orchestrator.goal_id_for_session(&self.session_key);
-            let verdict = run_goal_completion_verifier(
-                self.agent.llm_provider(),
-                &objective,
-                &assistant_tail,
+        // verifier LLM call when the agent actually CLAIMS completion — and
+        // only when a goal snapshot exists to verify against.
+        //
+        // #1935 codex round 3 (TOCTOU): the goal_id and the objective are
+        // captured together under ONE state lock
+        // (`goal_verification_snapshot`), so a clear/recreate between two
+        // separate reads can no longer pair the OLD objective with the NEW
+        // goal_id (or a same-objective recreate slip both checks).
+        // `maybe_complete_goal_from_model` re-checks BOTH snapshot fields
+        // after the verifier await. No goal / wrong profile ⇒ no snapshot ⇒
+        // no verifier spend and nothing to complete.
+        let verification = if orchestrator.goal_completion_claimed(&assistant_tail) {
+            orchestrator.goal_verification_snapshot(&self.session_key, profile_id)
+        } else {
+            None
+        };
+        if let Some(snapshot) = verification {
+            // #1935 — grade on the INDEPENDENT verifier lane when the profile
+            // configures one (`sub_providers` key `goal_verifier`); otherwise
+            // the session's own provider, unchanged.
+            let verifier_provider = self
+                .goal_verifier_llm
+                .clone()
+                .unwrap_or_else(|| self.agent.llm_provider());
+            // #1958 (codex #3) — restore originating-session attribution around
+            // the sentinel verifier (it runs outside the turn's routing scopes),
+            // so a failover attributes to this session instead of publishing
+            // unattributed. Autonomous turns are Normal policy → router only.
+            let (verdict, verifier_usage) = octos_llm::with_router_context(
+                octos_llm::RouterContext {
+                    session_id: Some(self.session_key.to_string()),
+                    ..Default::default()
+                },
+                run_goal_completion_verifier_with_usage(
+                    verifier_provider,
+                    &snapshot.objective,
+                    &assistant_tail,
+                ),
             )
             .await;
-            (verdict, goal_id)
-        } else {
-            (
-                GoalCompletionVerdict::NotDone {
-                    reason: "no completion claimed".to_string(),
-                },
-                None,
-            )
-        };
-        if orchestrator.maybe_complete_goal_from_model(
-            &self.session_key,
-            profile_id,
-            &assistant_tail,
-            &verdict,
-            expected_goal_id.as_deref(),
-        ) {
-            return;
+            // #1958 — the verifier call is real goal spend: fold it into the
+            // goal's tokens_used BEFORE `maybe_complete_goal_from_model` can
+            // flip the goal (a `complete` goal can no longer be charged).
+            // `record_goal_turn` above only charged the turn's own tokens.
+            let _ = orchestrator.charge_goal_verifier_usage(
+                &self.session_key,
+                profile_id,
+                Some(&snapshot.goal_id),
+                &verifier_usage,
+            );
+            if orchestrator.maybe_complete_goal_from_model(
+                &self.session_key,
+                profile_id,
+                &assistant_tail,
+                &verdict,
+                &snapshot,
+                // #1957 (codex #1) — this interactive-chat goal path carries the
+                // profile data dir, so a sentinel completion syncs to the ledger.
+                Some(self.data_dir.as_path()),
+            ) {
+                return;
+            }
         }
         // Re-queue another continuation only if we are still idle AND
         // policy allows. The idle gate matches `drain_master_continuations`'s
         // entry idle gate so a goal turn that filled the inbox does not
         // immediately enqueue another goal turn ahead of pending user
         // input.
-        let idle_state = crate::api::goal_loop_runtime::RuntimeIdleState::idle()
+        let idle_state = crate::autonomy::goal_loop_runtime::RuntimeIdleState::idle()
             .with_user_input_pending(!self.inbox.is_empty());
         let _ =
             orchestrator.maybe_enqueue_goal_after_turn(&self.session_key, profile_id, idle_state);
-    }
-
-    #[cfg(not(feature = "api"))]
-    async fn drain_master_continuations(&mut self) -> bool {
-        false
     }
 
     // ── Phase 4: human-approval bridge (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
@@ -7595,7 +7648,7 @@ impl SessionActor {
                             &history_for_agent,
                             media,
                             attachments,
-                            &tracker,
+                            std::sync::Arc::clone(&tracker),
                         ),
                     ),
                 ),
@@ -9312,6 +9365,46 @@ impl SessionActor {
         // (a `None` stamp would leak failovers to every concurrent
         // session on a shared profile-scoped router), so we MUST set it
         // here.
+        // #2003 — keep this session's in-flight marker fresh WHILE the turn is
+        // genuinely producing, so a legitimately long turn is never mistaken
+        // for an abandoned one and un-protected mid-flight.
+        //
+        // The refresh is gated on OBSERVABLE PROGRESS (the shared TokenTracker
+        // advancing), not on the turn merely existing. A plain timer would keep
+        // re-stamping in exactly the case the staleness horizon is for — a turn
+        // wedged forever awaiting something that never resolves — and would
+        // silently revert #2004. A turn that has stopped producing tokens stops
+        // being refreshed and ages out normally.
+        //
+        // `touch_goal_dispatch_in_flight` is a no-op when this session has no
+        // marker (an ordinary interactive turn), so this costs nothing there.
+        // Refresh gated on the turn's own LLM work PRODUCING. The other proof
+        // of life — this session having non-terminal background-task agents,
+        // i.e. a turn blocked awaiting sub-agents, which emits no tokens at all
+        // — is evaluated inside `is_goal_dispatch_in_flight` itself, next to
+        // the marker, because the orchestrator already receives that state via
+        // `upsert_background_task_agent` and needs no plumbing to see it.
+        let in_flight_heartbeat = {
+            let tracker = Arc::clone(&token_tracker);
+            let session_key = self.session_key.clone();
+            tokio::spawn(async move {
+                use std::sync::atomic::Ordering as AtomicOrdering;
+                let mut last = 0_u64;
+                loop {
+                    tokio::time::sleep(IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                    let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                        + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                    if seen > last {
+                        last = seen;
+                        default_agent_orchestrator().touch_goal_dispatch_in_flight(&session_key);
+                    }
+                }
+            })
+        };
+        // Abort on EVERY exit path from the turn below (including error and
+        // cancellation) — the guard drops with the enclosing scope.
+        let _in_flight_heartbeat = AbortOnDrop(in_flight_heartbeat);
+
         let llm_start = Instant::now();
         let result = octos_llm::with_router_context(
             octos_llm::RouterContext {
@@ -9329,7 +9422,7 @@ impl SessionActor {
                         attachment_prompt,
                         Self::inbound_live_video(&inbound),
                     ),
-                    &token_tracker,
+                    std::sync::Arc::clone(&token_tracker),
                 ),
             ),
         )
