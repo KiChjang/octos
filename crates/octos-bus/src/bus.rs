@@ -28,8 +28,8 @@ impl AgentHandle {
     pub async fn send_outbound(
         &self,
         msg: OutboundMessage,
-    ) -> Result<(), mpsc::error::SendError<OutboundMessage>> {
-        self.out_tx.send(msg).await
+    ) -> Result<(), Box<mpsc::error::SendError<OutboundMessage>>> {
+        self.out_tx.send(msg).await.map_err(Box::new)
     }
 
     /// Clone the outbound sender for use by tools (e.g. MessageTool).
