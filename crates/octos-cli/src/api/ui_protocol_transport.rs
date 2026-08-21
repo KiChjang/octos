@@ -61,15 +61,15 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -81,7 +81,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use super::AppState;
 use super::metrics::MetricsReporter;
@@ -565,7 +565,6 @@ pub(crate) struct WsConnection {
     /// [`update_live_features`]). Reads are far more frequent than
     /// writes, so `RwLock` is the right fit.
     live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
-    live_profile_id: Arc<std::sync::RwLock<String>>,
 }
 
 impl WsConnection {
@@ -578,7 +577,6 @@ impl WsConnection {
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
-            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -594,7 +592,6 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(
                 ConnectionUiFeatures::stdio_defaults(),
             )),
-            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -619,21 +616,6 @@ impl WsConnection {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = features;
-    }
-
-    fn snapshot_live_profile_id(&self) -> String {
-        match self.live_profile_id.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    fn update_live_profile_id(&self, profile_id: String) {
-        let mut guard = match self.live_profile_id.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = profile_id;
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -1908,6 +1890,9 @@ struct ConnectionUiFeatures {
     skill_actions_v1: bool,
     /// Persisted background skill action jobs and their update events.
     skill_action_jobs_v1: bool,
+    /// task-return-unconsumed-steer-inputs: client asked for the
+    /// dropped-before-terminal steer settlement guarantee.
+    turn_steer_dropped_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2012,6 +1997,11 @@ impl ConnectionUiFeatures {
                 query,
                 APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
             ),
+            turn_steer_dropped_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2061,6 +2051,7 @@ impl ConnectionUiFeatures {
             user_question_v1: true,
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
+            turn_steer_dropped_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2106,6 +2097,7 @@ impl ConnectionUiFeatures {
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
+            turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
             header_present: true,
             stdio_transport,
         }
@@ -2208,6 +2200,9 @@ impl ConnectionUiFeatures {
         }
         if self.skill_action_jobs_v1 {
             requested.push(APPUI_FEATURE_SKILL_ACTION_JOBS_V1);
+        }
+        if self.turn_steer_dropped_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -4399,6 +4394,12 @@ impl Drop for AbortOnDrop {
 /// (`tick % 8 == 0`) so the cadence feels identical across surfaces.
 const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// #2066 round 4 (codex fix 2) — cadence of the AppUI goal-turn in-flight
+/// heartbeat, mirroring the session actor's `IN_FLIGHT_HEARTBEAT_INTERVAL`
+/// (#2003): well under the 30-minute staleness horizon, coarse enough to be
+/// free.
+const APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// CJK code-point check shared with `status_indicator::has_cjk` — kept
 /// inline here to avoid pulling the channel-aware status_indicator
 /// module into the WS turn path.
@@ -6047,6 +6048,9 @@ async fn ui_protocol_connection(
                     &contracts.user_questions,
                     &live_forwarders,
                     connection_profile_id,
+                    // Frozen at WS upgrade (and at session-ingress upgrade),
+                    // never rebound for the life of this connection.
+                    connection_profile_id,
                     features,
                     id,
                     params,
@@ -6818,6 +6822,11 @@ where
                     &contracts.user_questions,
                     &live_forwarders,
                     next_connection_profile_id.as_deref(),
+                    // NOT pinned: stdio rebinds `connection_profile_id_owned`
+                    // after every successful open, so a later open under
+                    // another profile retargets this session's turns exactly
+                    // as `session_open_profile_id` does on the WS path.
+                    None,
                     features,
                     id,
                     params,
@@ -10659,6 +10668,33 @@ async fn invoke_skill_action_tool_binding(
     Ok(Value::Object(response))
 }
 
+/// #2055 review round 2 (coverage holes c + d) — wire the goal-task-row
+/// observer pair onto a CACHED session supervisor (`session_runtime.tools`),
+/// which outlives goals coming and going, so the goal binding resolves at
+/// CALLBACK time via `active_goal_id` — the gateway idiom, not the per-turn
+/// dispatch snapshot. Installed idempotently at each point of use, the same
+/// pattern as [`install_skill_action_job_projection_listener`] below (the
+/// SessionRuntime constructor is deliberately left out of the loop: the
+/// session-cache layer has no autonomy coupling today, and point-of-use
+/// wiring keeps it that way). Snapshots taken from this registry
+/// (`snapshot_excluding` — e.g. the native-review specialist swarm) inherit
+/// the pair onto their fresh supervisors.
+fn wire_goal_task_row_observers_for_cached_supervisor(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+    profile_id: &str,
+    profile_data_dir: &std::path::Path,
+) {
+    // Round 3 — thin adapter over the SHARED installer so this site cannot
+    // drift from the per-turn / gateway wiring or from the effect tests.
+    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+        supervisor,
+        session_id,
+        profile_id,
+        profile_data_dir,
+    );
+}
+
 fn install_skill_action_job_projection_listener(
     supervisor: &octos_agent::TaskSupervisor,
     profile_id: &str,
@@ -11063,6 +11099,16 @@ async fn raw_skill_action_invoke(
             let batch_permit = reserve_skill_action_batch()?;
             let profile_id = session_runtime.profile.profile_id.clone();
             let supervisor = session_runtime.tools.supervisor();
+            // #2055 review round 2 (hole d) — background skill actions
+            // register on THIS cached supervisor, not the per-turn snapshot
+            // the turn path wires, so give it the goal-task-row observer
+            // pair here (resolve-at-callback; idempotent re-install).
+            wire_goal_task_row_observers_for_cached_supervisor(
+                &supervisor,
+                &params.session_id,
+                &profile_id,
+                &session_runtime.profile.data_dir,
+            );
             install_skill_action_job_projection_listener(
                 &supervisor,
                 &profile_id,
@@ -11145,6 +11191,21 @@ async fn load_skill_action_job_view(
         Ok(runtime) => {
             let profile_id = runtime.profile.profile_id.clone();
             let supervisor = runtime.tools.supervisor();
+            // #2056 round 2 (H2a) — wire the goal-task-row pair BEFORE this
+            // path's `enable_persistence`. This request can be the FIRST thing
+            // to touch the cached session supervisor after boot; a later
+            // wiring re-enables the same ledger path and returns at
+            // `enable_persistence`'s idempotence guard, so the restore would
+            // otherwise be observed by nobody. (`set_on_restore` also delivers
+            // an already-missed restore, which covers any future site that
+            // enables first — this keeps the observers present from the very
+            // first touch so registrations in between are recorded too.)
+            wire_goal_task_row_observers_for_cached_supervisor(
+                &supervisor,
+                session_id,
+                &profile_id,
+                &runtime.profile.data_dir,
+            );
             install_skill_action_job_projection_listener(
                 &supervisor,
                 &profile_id,
@@ -11168,9 +11229,15 @@ async fn load_skill_action_job_view(
         }
         Err(_) => {
             let (profile_id, store_root) = skill_action_profile_data_dir(state, active_profile_id)?;
-            let jobs = load_skill_action_jobs(&store_root, session_id).map_err(|error| {
-                RpcError::internal_error(format!("failed to restore skill action tasks: {error}"))
-            })?;
+            // #2056 round 3 (R4) — `store_root` IS the profile data dir, so the
+            // throwaway supervisor inside can wire the goal-task-row observers
+            // and reconcile like every other restore path.
+            let jobs =
+                load_skill_action_jobs(&store_root, &profile_id, session_id).map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to restore skill action tasks: {error}"
+                    ))
+                })?;
             Ok((profile_id, jobs))
         }
     }
@@ -11949,22 +12016,30 @@ async fn raw_profile_llm_test(
         api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
     };
 
-    let Some(api_key) = secret_from_value(params.api_key).or_else(|| {
+    let resolved_key = secret_from_value(params.api_key).or_else(|| {
         route.api_key_env.as_ref().and_then(|env_name| {
             // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
             // SA JSON); plain values pass through unchanged.
             let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
             crate::auth::keychain::resolve_value(env_name, raw)
         })
-    }) else {
-        return Ok(profile_llm_test_result(
-            state,
-            &profile_id,
-            profile.as_ref(),
-            false,
-            "Provider connection failed",
-            Some("No API key provided".into()),
-        ));
+    });
+    let api_key = match resolved_key {
+        Some(key) => key,
+        // Keyless local families (local/ollama/vllm) construct without a
+        // key — dead-ending them on "No API key provided" blocked the
+        // keyless onboarding test entirely (red-team pass).
+        None if octos_llm::registry::is_keyless(&family_id) => String::new(),
+        None => {
+            return Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+                "Provider connection failed",
+                Some("No API key provided".into()),
+            ));
+        }
     };
 
     let provider =
@@ -12083,13 +12158,19 @@ async fn raw_profile_llm_fetch_models(
         })
     });
 
-    let Some(api_key) = api_key else {
-        return Ok(json!({
-            "profile_id": profile_id,
-            "family_id": family_id,
-            "models": [],
-            "reason": "no_api_key",
-        }));
+    let api_key = match api_key {
+        Some(key) => key,
+        // Keyless local families still get model listing — their /v1/models
+        // answers without auth (red-team pass).
+        None if octos_llm::registry::is_keyless(&family_id) => String::new(),
+        None => {
+            return Ok(json!({
+                "profile_id": profile_id,
+                "family_id": family_id,
+                "models": [],
+                "reason": "no_api_key",
+            }));
+        }
     };
 
     let models =
@@ -12119,7 +12200,9 @@ fn build_test_llm_provider(
     api_key: &str,
 ) -> Result<Arc<dyn octos_llm::LlmProvider>, String> {
     let params = octos_llm::registry::CreateParams {
-        api_key: Some(api_key.to_owned()),
+        // Empty means "keyless family" — let the factory apply its own
+        // fallback instead of sending an empty Bearer token.
+        api_key: (!api_key.is_empty()).then(|| api_key.to_owned()),
         model: Some(model_id.to_owned()),
         base_url: base_url.clone(),
         model_hints: None,
@@ -14882,44 +14965,83 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<Own
     let mut owned = Vec::new();
     for entry in read_dir.flatten() {
         let slug = entry.file_name().to_string_lossy().into_owned();
-        // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
-        // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
-        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+        let Some((originator, peer)) = read_owned_peer_entry(peers_root, slug) else {
             continue;
         };
-        // Retired peer: neither blocks nor keeps the fleet alive.
-        if peer_io::peer_regular_file_exists(&dir, "closed") {
+        // Originator gate — only peers THIS master staged.
+        if originator != master {
             continue;
         }
-        // Originator gate — only peers THIS master staged. After the atomic
-        // owner-before-brief write in `stage_peer`, a visible (brief.md) member
-        // always has a readable originator, so a member of THIS master is never
-        // silently dropped from the ownership scan.
-        let Some(originator) =
-            peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
-        else {
-            continue;
-        };
-        if originator.trim() != master {
-            continue;
-        }
-        let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
-        // #2024: how many rounds this peer has DELIVERED. Versioned results
-        // (`result-<n>.md`) have existed since #435, but a peer whose result
-        // predates them has only the bare `result.md` — floor it at 1 so it
-        // can still exceed a mark of 0 and synthesize at all.
-        let round = if has_result {
-            crate::peers::count_peer_result_versions(&dir).max(1)
-        } else {
-            0
-        };
-        owned.push(OwnedPeer {
+        owned.push(peer);
+    }
+    Some(owned)
+}
+
+/// Read ONE `peers/<slug>` entry as `(originating master, fleet inputs)`, or
+/// `None` when it is not a live owned peer.
+///
+/// Single definition of "owned", shared by the per-master scan
+/// ([`collect_owned_peer_results`]) and the boot-time all-fleets scan
+/// ([`collect_peer_fleets_by_master`]) so the two can never disagree about
+/// which peers a fleet has — a divergence would let the boot sweep judge a
+/// fleet against a different membership than the turn-terminal edges do.
+fn read_owned_peer_entry(peers_root: &Path, slug: String) -> Option<(String, OwnedPeer)> {
+    // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
+    // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
+    let dir = staged_peer_dir(peers_root, &slug)?;
+    // Retired peer: neither blocks nor keeps the fleet alive.
+    if peer_io::peer_regular_file_exists(&dir, "closed") {
+        return None;
+    }
+    // After the atomic owner-before-brief write in `stage_peer`, a visible
+    // (brief.md) member always has a readable originator, so a member of a
+    // master's fleet is never silently dropped from the ownership scan.
+    let originator =
+        peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)?;
+    let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
+    // #2024: how many rounds this peer has DELIVERED. Versioned results
+    // (`result-<n>.md`) have existed since #435, but a peer whose result
+    // predates them has only the bare `result.md` — floor it at 1 so it
+    // can still exceed a mark of 0 and synthesize at all.
+    let round = if has_result {
+        crate::peers::count_peer_result_versions(&dir).max(1)
+    } else {
+        0
+    };
+    Some((
+        originator.trim().to_owned(),
+        OwnedPeer {
             slug,
             has_result,
             round,
-        });
+        },
+    ))
+}
+
+/// Every live peer under `peers_root`, grouped by the master that staged it.
+///
+/// The inverse of [`collect_owned_peer_results`], which needs the master up
+/// front. The boot sweep (#2033) has no master to start from — nothing is
+/// terminating, there is no session in hand — so it discovers the fleets from
+/// the directory itself, in ONE scan rather than one scan per candidate master.
+///
+/// Same fail-closed contract: `None` when `peers/` cannot be READ, so a
+/// transient scan error is never mistaken for "no fleets".
+fn collect_peer_fleets_by_master(peers_root: &Path) -> Option<HashMap<String, Vec<OwnedPeer>>> {
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
+    let mut fleets: HashMap<String, Vec<OwnedPeer>> = HashMap::new();
+    for entry in read_dir.flatten() {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some((originator, peer)) = read_owned_peer_entry(peers_root, slug) else {
+            continue;
+        };
+        // An empty originator names no master; it can never be evaluated.
+        if originator.is_empty() {
+            continue;
+        }
+        fleets.entry(originator).or_default().push(peer);
     }
-    Some(owned)
+    Some(fleets)
 }
 
 /// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
@@ -15175,6 +15297,110 @@ async fn evaluate_and_enqueue_fleet_synthesis(
             );
         }
     }
+}
+
+/// True when `master`'s fleet has a peer whose DELIVERED round is past what the
+/// stamp records as summarized — i.e. a synthesis is OWED for this fleet.
+///
+/// Deliberately the freshness half of [`evaluate_peer_fleet_synthesis`] and
+/// nothing else: it is a cheap pre-filter, not a second gate. Idle/settled/done
+/// are re-decided by the real evaluation, which is the only thing allowed to
+/// fire. A [`Legacy`](FleetSynthesisMarks::Legacy) record reads every peer as
+/// covered at its current round, so an unparseable stamp is never owed — the
+/// same fail-closed posture the gate takes.
+fn peer_fleet_synthesis_is_owed(marks: &FleetSynthesisMarks, peers: &[OwnedPeer]) -> bool {
+    peers
+        .iter()
+        .any(|peer| peer.round > synthesized_round_for(marks, &peer.slug, peer.round))
+}
+
+/// The `exclude_session` the BOOT sweep passes to the shared evaluation.
+///
+/// Every other caller is a session whose turn is terminating right now and so
+/// must not count against idle/settled. At boot NOTHING is terminating, so
+/// nothing may be excluded. A session key is always `<profile>:<channel>:<id>`,
+/// so the empty key can never name a real session and removing it from the
+/// live-turn set is a guaranteed no-op — which is exactly the intent.
+fn boot_sweep_exclude_session() -> SessionKey {
+    SessionKey(String::new())
+}
+
+/// #2033 — BOOT-TIME evaluation of owed peer-fleet synthesis, for one profile.
+/// Returns how many fleets were evaluated (i.e. how many were owed).
+///
+/// The synthesis gate is EDGE-triggered: [`evaluate_and_enqueue_fleet_synthesis`]
+/// is reached from exactly two edges, a PEER turn terminal and a MASTER turn
+/// terminal. That is sound *within* a process — a deduped enqueue deliberately
+/// holds the marks back (#2024) and the in-flight continuation's own terminal is
+/// the guaranteed retry edge. A process restart is what has no edge at all: when
+/// the owed round's retry edge was still in the future at the moment the process
+/// died, the new process has nothing that recomputes the gate.
+///
+/// Observed live (mini5 soak, #2033): a peer's round-2 terminal landed while a
+/// round-1 synthesis was in flight, so the enqueue deduped and the marks stayed
+/// at round 1; the serve was killed before that continuation reached terminal.
+/// After the restart the master session sat for 220s with the round still
+/// unsynthesized, and one trivial master turn advanced it in 3s. The peer's last
+/// round of work is written up only if the user happens to type again — on a
+/// quiet fleet, never.
+///
+/// This is the missing boot edge, and it is the boot-resume precedent already
+/// applied to restart-stranded fleet-kernel fleets
+/// ([`crate::autonomy::fleet_wake::enqueue_fleet_boot_resume_wakes`]) and to
+/// persisted monitors: recompute at startup what only an event would otherwise
+/// recompute.
+///
+/// BOUNDED, not a poll. One `peers/` scan per profile at startup, then the real
+/// evaluation ONLY for fleets whose delivered round is past their recorded mark.
+/// Fleets with nothing new pay a mark read and no more, and the turn-terminal
+/// edges are untouched — no tick, no re-arm-on-dedupe, no per-tick scan.
+///
+/// Enqueue-only: the continuation is drained by the same
+/// `spawn_global_master_continuation_drain` / per-connection tick as any other,
+/// under the same workspace-known gate. So a master session that has not been
+/// opened this process run defers until it is — which is the observed case
+/// (the user opens the master, then waits), and it fires on the next drain tick
+/// instead of never.
+pub(crate) async fn enqueue_boot_owed_peer_fleet_synthesis(
+    profile_id: &str,
+    peers_root: &Path,
+) -> usize {
+    // Cheap early-out: a profile that has never staged a peer has no fleets.
+    if !peers_root.is_dir() {
+        return 0;
+    }
+    // FAIL-CLOSED, as everywhere else on this path: an unreadable `peers/` is
+    // "can't determine", not "no fleets".
+    let Some(fleets) = collect_peer_fleets_by_master(peers_root) else {
+        tracing::warn!(
+            profile = profile_id,
+            peers_root = %peers_root.display(),
+            "boot peer-fleet synthesis sweep: peers/ unreadable; skipping this profile"
+        );
+        return 0;
+    };
+    let exclude = boot_sweep_exclude_session();
+    let mut evaluated = 0usize;
+    for (master, peers) in fleets {
+        let marks = read_peer_fleet_synthesis_marks(peers_root, &master);
+        if !peer_fleet_synthesis_is_owed(&marks, &peers) {
+            continue;
+        }
+        evaluated += 1;
+        // Hand off to the SAME evaluation the two turn-terminal edges use — it
+        // re-reads the fleet, re-checks master-idle/settled, and owns the
+        // exactly-once marks write. The boot sweep only decides WHO to look at.
+        evaluate_and_enqueue_fleet_synthesis(profile_id, peers_root, &master, &exclude).await;
+    }
+    if evaluated > 0 {
+        tracing::info!(
+            profile = profile_id,
+            fleets = evaluated,
+            "boot peer-fleet synthesis sweep: re-evaluated fleets whose last round was \
+             left unsynthesized when the previous process exited"
+        );
+    }
+    evaluated
 }
 
 /// Serializes profile `sub_providers` read-modify-write across concurrent
@@ -16719,6 +16945,11 @@ async fn handle_session_open(
     questions: &PendingQuestionStore,
     live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
+    // #2067 — the profile this connection is FROZEN to for its whole lifetime,
+    // or `None` when the transport has no such pin. Used only to decide whether
+    // the session scope may serve as a DELIVERY filter; it never changes what
+    // the session resolves to. See `ledger_event_matches_profile_scope`.
+    pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     mut params: SessionOpenParams,
@@ -16744,6 +16975,7 @@ async fn handle_session_open(
         questions,
         ws.connection_id,
         connection_profile_id,
+        pinned_profile_id,
         features,
         params,
     )
@@ -16761,7 +16993,14 @@ async fn handle_session_open(
             return false;
         }
     };
-    ws.update_live_profile_id(outcome.profile_id.clone());
+    // #2067 (H2) — this session's resolved profile, captured for the live
+    // forwarder installed at the end of this function. It is deliberately a
+    // per-forwarder value and NOT connection-wide state: a connection keeps one
+    // forwarder PER SESSION, and an unscoped connection may open a second
+    // session under a different profile. Sharing one mutable cell across
+    // forwarders let the second open silently retarget the first session's
+    // pump, starving it of every profile-carrying frame.
+    let live_profile_scope = outcome.profile_scope.clone();
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -16803,7 +17042,7 @@ async fn handle_session_open(
     //
     // Reusing the helper keeps replay and live capability behavior in lockstep.
     for event in outcome.replay {
-        if !ledger_event_matches_profile_scope(&event.event, &outcome.profile_id) {
+        if !ledger_event_matches_profile_scope(&event.event, outcome.profile_scope.as_deref()) {
             continue;
         }
         let projected = features
@@ -16900,6 +17139,7 @@ async fn handle_session_open(
         ws.connection_id,
         features,
         topic_scope,
+        live_profile_scope,
         live_rx,
         live_forwarders.clone(),
     )
@@ -16951,13 +17191,211 @@ fn ledger_event_matches_topic_scope(
     }
 }
 
-fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id: &str) -> bool {
-    match event {
-        UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(update)) => {
-            update.profile_id == profile_id
+/// #2067 — a durable event that names a profile must reach ONLY connections
+/// resolved to that profile. This filter runs at all three delivery boundaries
+/// (the `replay.retain` in `open_session_result`, the session/open replay send
+/// loop, and the live forwarder pump), so a variant it does not recognise
+/// leaks across tenants on every shared/unprofiled wire session key — which is
+/// exactly what `session/goal/updated` and `session/goal/cleared` did — and
+/// what the `loop/*` and `monitor/*` frames beside them did, since most of them
+/// are appended DURABLY by the same `record_autonomy_rpc_evidence` ->
+/// `send_notification_durable` dispatch and all of them carry tenant text
+/// (goal objective, loop prompt, monitor argv/name).
+///
+/// `MonitorFired` and `BackgroundActivity` are the exceptions to "stamped by
+/// `resolve_autonomy_profile_id`": both are emitted off the continuation drain
+/// from a stored record, and that record's profile is the TURN's
+/// `ProfileRuntime` id whenever the monitor or fleet was created by a model
+/// tool. Filtering them is safe only because
+/// [`connection_filterable_profile_scope`] refuses to filter on a scope that
+/// can disagree with the turn's profile.
+///
+/// `profile_id` is the connection's RESOLVED scope and is always a concrete
+/// string — [`WsConnection`] seeds [`MAIN_PROFILE_ID`] and `session/open`
+/// overwrites it with `open_session_result`'s
+/// `active_profile_id.unwrap_or(MAIN_PROFILE_ID)`. `_main` is therefore a real
+/// scope on both sides of the wire, NOT a wildcard: the emitters normalize the
+/// same way (`resolve_autonomy_profile_id` returns `_main` for an unprofiled
+/// deployment), and treating an unscoped connection as "authorized for any
+/// profile" is deployment-dependent — see the KNOWN LIMITATION on the
+/// interactive goal-charge binding.
+///
+/// NOT filtered, deliberately: `AgentUpdated`, `PeerStaged` and `PeerClosed`.
+/// All three are durable and all three leak, but they are stamped from the
+/// TURN's `ProfileRuntime` rather than from `validate_session_scope`, and those
+/// two resolutions diverge when an unscoped connection carries a routed profile
+/// (`connection_profile_id.or(routed_profile_id)` — `validate_session_scope`
+/// never consults the routed id). Filtering them before that divergence is
+/// closed would starve exactly the reconnect-replay path they exist for. See
+/// issue #2081. `LoopCompleted` / `MonitorExpired` have no producer at all
+/// (issue #2080).
+///
+/// Every arm below prefers the event's top-level stamp and falls back to the
+/// profile on the record it carries. The fallback is not cosmetic: the
+/// `loop/pause`, `loop/resume` and `loop/delete` results omit the top-level
+/// `profile_id` entirely (see `AgentOrchestrator::control_loop`) and only the
+/// nested `loop` record names the owner. A fallback can only ever NARROW an
+/// event's audience, never widen it.
+/// #2067 — the profile scope a connection may be FILTERED against, or `None`
+/// when it has none and every delivery must pass.
+///
+/// Filtering is sound only when the scope a forwarder captured at
+/// `session/open` provably equals the profile that session's TURNS run under,
+/// for the whole life of the forwarder. That matters because a turn's
+/// `ProfileRuntime` hard-binds its profile onto every record the model's tools
+/// create (`runtime/profile.rs` registers `MonitorCreateTool::new(profile.id)`,
+/// and the tool persists that id), and the durable frames those records emit
+/// carry it. Filter against a scope the turn does not share and the connection
+/// is starved of its OWN data — fatally so for `background/activity`, whose
+/// sink appends over a detached connection and therefore has no delivery path
+/// except replay and live fan-out.
+///
+/// The turn resolves
+/// `session.profile_id().or(connection.or(routed.or(session_open)))`, and both
+/// `routed` and `session_open` are per-CONNECTION mutable state: `session_open`
+/// is a single cell that every successful open overwrites, so opening a second
+/// bare session under another profile retargets the turns of the FIRST one.
+/// A per-session captured scope can never track that.
+///
+/// The one binding that cannot drift is an authenticated connection profile:
+/// it is frozen at WS upgrade, and `validate_authenticated_session_scope`
+/// forces every session opened on that connection to it or rejects the open
+/// outright. So the whole connection has exactly one profile, every forwarder
+/// captures it, and `connection.or(..)` short-circuits onto it for every turn.
+/// That is the only case this filter may act on, and it is exactly the case
+/// #2067 reports: a tenant is an authenticated user.
+///
+/// A routed profile cannot break this even when it names a DIFFERENT profile —
+/// which it legitimately can, since an admin-role user is authorized for every
+/// profile and a parent user for its owned subaccounts, and both still present
+/// an authenticated `connection_profile_id`. `connection.or(routed)` never
+/// reaches `routed` while the connection profile is set, and a session key
+/// belonging to another profile is rejected before any turn starts.
+///
+/// Callers pass `None` for a transport whose binding is NOT frozen — stdio
+/// rebinds `connection_profile_id_owned` after every successful open, so it
+/// drifts exactly as `session_open` does and must not be filtered. Declining to
+/// filter costs no tenant isolation: an unscoped WS connection is an
+/// admin/operator authorized for every profile (or auth is disabled and every
+/// route is deliberately open), and stdio is a single local user.
+fn ledger_event_matches_profile_scope(
+    event: &UiProtocolLedgerEvent,
+    profile_id: Option<&str>,
+) -> bool {
+    // `None` = this connection's scope is not a tenant boundary (see
+    // `connection_filterable_profile_scope`); deliver everything.
+    let Some(profile_id) = profile_id else {
+        return true;
+    };
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return true;
+    };
+    match notification {
+        UiNotification::SkillActionJobUpdated(update) => update.profile_id == profile_id,
+        // The goal chip's reducers are session-keyed and apply `updated`
+        // unconditionally, so a foreign profile's objective/budget would paint
+        // straight into this connection's chip.
+        UiNotification::SessionGoalUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.goal.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::SessionGoalCleared(cleared) => optional_profile_scope_matches(
+            cleared.profile_id.as_deref().or_else(|| {
+                cleared
+                    .goal
+                    .as_ref()
+                    .and_then(|goal| goal.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
+        UiNotification::LoopUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.loop_state.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::LoopFired(fired) => optional_profile_scope_matches(
+            fired.profile_id.as_deref().or_else(|| {
+                fired
+                    .loop_state
+                    .as_ref()
+                    .and_then(|loop_state| loop_state.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
+        UiNotification::MonitorUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.monitor_state.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::MonitorFired(fired) => {
+            optional_profile_scope_matches(fired.profile_id.as_deref(), profile_id)
+        }
+        // `session/open` is appended for BROADCAST — the emit site tags it with
+        // the opening connection id specifically so OTHER connections observe
+        // it — and it carries `workspace_root`, the context snapshot and pane
+        // snapshots, i.e. another tenant's paths and buffers on a shared key.
+        // Filtering it cannot starve its own opener: that connection's
+        // forwarder skips the broadcast copy via `from_connection`, and its own
+        // frame arrives through the UNFILTERED `send_ledger_event_durable`
+        // direct send in `handle_session_open`. The scopes also agree by
+        // construction — `ledger_profile_id` IS `active_profile_id
+        // .unwrap_or(MAIN_PROFILE_ID)`, which is exactly this normalization.
+        UiNotification::SessionOpened(opened) => {
+            optional_profile_scope_matches(opened.active_profile_id.as_deref(), profile_id)
+        }
+        // `background/activity` is raw OBSERVED text — a monitor's stdout, a
+        // fleet summary — and the ledger is its entire delivery mechanism: the
+        // sink appends it over a detached connection whose writer is drained to
+        // nowhere, so every real client receives it through replay or its own
+        // forwarder.
+        //
+        // Its profile is NOT resolver-derived. The fleet origin is stamped from
+        // `FleetRecord.profile_id`, and the single production fleet-creation
+        // site is reached only from the model's `goal_plan` tool, so that id is
+        // always the TURN's `ProfileRuntime` id; the monitor origin is likewise
+        // `ProfileRuntime`-derived whenever the monitor came from
+        // `monitor_create` rather than the `monitor/create` RPC. Together with
+        // `MonitorFired` below, these are the only two arms here whose stamp can
+        // come from the turn rather than from `resolve_autonomy_profile_id` —
+        // which is exactly why filtering is gated on
+        // `connection_filterable_profile_scope`, under which the two resolutions
+        // provably agree.
+        UiNotification::BackgroundActivity(activity) => {
+            optional_profile_scope_matches(activity.profile_id.as_deref(), profile_id)
         }
         _ => true,
     }
+}
+
+/// #2067 — compare an OPTIONAL wire profile id against a connection's resolved
+/// scope.
+///
+/// `event_profile_id` is the result of the caller's top-level-then-nested
+/// fallback, so a `None` here means the frame names no profile ANYWHERE. That
+/// is a LEGACY row: the field is `skip_serializing_if = "Option::is_none"`, and
+/// every current producer stamps a concrete id somewhere on the frame
+/// (`resolve_autonomy_profile_id` never returns an empty or absent id, and the
+/// stored `AutonomyGoalRecord` / `AutonomyLoopRecord` / `AutonomyMonitorRecord`
+/// hold a non-optional `profile_id`), so a fully unstamped frame can only have
+/// been persisted by a backend that predates the stamp. Only an
+/// unprofiled/single-tenant deployment could have produced one, and every
+/// connection there resolves to `_main` — so normalizing `None` to `_main` is
+/// lossless exactly where such rows exist, while still refusing to hand a
+/// legacy row to a real tenant. An empty/whitespace id normalizes the same way
+/// rather than becoming an accidental wildcard.
+fn optional_profile_scope_matches(event_profile_id: Option<&str>, profile_id: &str) -> bool {
+    event_profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(MAIN_PROFILE_ID)
+        == profile_id
 }
 
 fn stdio_session_open_candidate_profile(
@@ -16989,6 +17427,12 @@ async fn spawn_live_forwarder(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<String>,
+    // #2067 (H2) — the profile this SESSION resolved to at `session/open`,
+    // captured immutably for the lifetime of this forwarder exactly like
+    // `topic_scope`. Never re-read from the connection: a later
+    // `session/open` on the same connection can resolve a different profile,
+    // and a shared cell would retarget this pump mid-flight.
+    profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
 ) {
@@ -17028,10 +17472,7 @@ async fn spawn_live_forwarder(
                     if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
                         continue;
                     }
-                    if !ledger_event_matches_profile_scope(
-                        &event.event,
-                        &ws.snapshot_live_profile_id(),
-                    ) {
+                    if !ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref()) {
                         continue;
                     }
                     // Stage 1 v2 is a wire projection of this existing
@@ -17528,7 +17969,10 @@ struct SessionOpenOutcome {
     /// where an event landing between replay and the session/open append
     /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
     replay_baseline_seq: u64,
-    profile_id: String,
+    /// #2067 R3 — the profile scope this connection may be FILTERED against,
+    /// or `None` when its scope is not a tenant boundary and filtering it
+    /// would starve it. See `connection_filterable_profile_scope`.
+    profile_scope: Option<String>,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -17542,6 +17986,7 @@ async fn open_session_result(
     questions: &PendingQuestionStore,
     connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     mut params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
@@ -17555,6 +18000,11 @@ async fn open_session_result(
     let ledger_profile_id = active_profile_id
         .clone()
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    // #2067 — see `ledger_event_matches_profile_scope`. `validate_session_scope`
+    // returns the connection profile verbatim when there is one, so this equals
+    // `ledger_profile_id` in that case; naming the pin directly keeps the
+    // invariant (scope == the turn's profile) visible at the resolution site.
+    let profile_scope = pinned_profile_id.map(ToOwned::to_owned);
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -17761,7 +18211,7 @@ async fn open_session_result(
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
-            && ledger_event_matches_profile_scope(&event.event, &ledger_profile_id)
+            && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
     });
     let replayed_approval_ids = replay
         .iter()
@@ -17870,7 +18320,7 @@ async fn open_session_result(
         pending_questions,
         opened_event,
         replay_baseline_seq,
-        profile_id: ledger_profile_id,
+        profile_scope,
     })
 }
 
@@ -19836,8 +20286,11 @@ async fn handle_turn_start_with_accept(
 /// Outcome of the `turn/steer` registry decision (computed under the
 /// active-turns registry lock — see [`handle_turn_steer`]).
 enum TurnSteerDecision {
-    /// Input pushed into the ACTIVE turn's pending buffer.
-    Steered(TurnId),
+    /// Input pushed into the ACTIVE turn's pending buffer. `interrupting`
+    /// records that the turn was already winding down at acceptance
+    /// (task-turn-interrupt-steer-correlation-logs) — such input is likely
+    /// to be returned as `turn/steer_dropped` rather than drained.
+    Steered { turn_id: TurnId, interrupting: bool },
     /// `expected_turn_id` was present and does not name the active turn
     /// (codex `ExpectedTurnMismatch`). Carries the actual active id for the
     /// error message.
@@ -19904,7 +20357,19 @@ async fn handle_turn_steer(
                 // counts as live: the client asked to stop, and a raced
                 // steer behaves like the codex loop-exit race (buffered,
                 // possibly dropped at turn end — logged, never mis-routed).
-                let terminal = matches!(*existing.state.lock().await, TurnState::Terminal(_));
+                // task-return-unconsumed-steer-inputs: hold the turn-state
+                // guard across check AND push. `try_emit_terminal` settles
+                // the steer buffer right after it flips the state to
+                // `Terminal` (under this same lock) and BEFORE the terminal
+                // frame — so any input accepted here is either drained by
+                // the loop, or returned by that settlement; nothing can slip
+                // in between the settlement and the terminal frame.
+                let state = existing.state.lock().await;
+                let terminal = matches!(*state, TurnState::Terminal(_));
+                // task-turn-interrupt-steer-correlation-logs: input accepted
+                // while the turn is already winding down is the case that
+                // ends up returned as turn/steer_dropped.
+                let interrupting = matches!(*state, TurnState::Interrupting { .. });
                 if terminal {
                     TurnSteerDecision::NoActiveTurn
                 } else if params
@@ -19920,7 +20385,10 @@ async fn handle_turn_steer(
                             // the accept below can never name a turn that a
                             // concurrent admission already replaced.
                             buffer.push(prompt.clone());
-                            TurnSteerDecision::Steered(existing.turn_id.clone())
+                            TurnSteerDecision::Steered {
+                                turn_id: existing.turn_id.clone(),
+                                interrupting,
+                            }
                         }
                         None => TurnSteerDecision::NotSteerable,
                     }
@@ -19931,12 +20399,11 @@ async fn handle_turn_steer(
     };
 
     match decision {
-        TurnSteerDecision::Steered(turn_id) => {
-            info!(
-                session = %params.session_id.0,
-                turn = %turn_id.0,
-                "turn/steer accepted into the active turn's pending-input buffer"
-            );
+        TurnSteerDecision::Steered {
+            turn_id,
+            interrupting,
+        } => {
+            crate::turn_trace::log_steer_accepted(&params.session_id, &turn_id, interrupting);
             let _ = send_rpc_result(ws, id, json!({ "turn_id": turn_id, "steered": true }));
         }
         TurnSteerDecision::Mismatch(active_turn_id) => {
@@ -20032,27 +20499,33 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
-    // Cross-subsystem occupancy (#1529): a session actor draining a
-    // continuation turn for this session marks it in-flight but has no entry
-    // in this connection's `active_turns` map. Without this check the serve
-    // tick would drain + spawn a SECOND concurrent turn on the same session
-    // while the actor's turn runs. The actor clears the marker (RAII guard)
-    // when its turn ends, so the next tick re-dispatches normally.
-    if default_agent_orchestrator().is_goal_dispatch_in_flight(&goal_storage_key) {
-        return false;
-    }
-
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
             .approvals
             .pending_for_session(&session_id)
             .is_empty(),
     );
-    let Some(continuation) = default_agent_orchestrator()
-        .drain_ready_continuations_for_session(&goal_storage_key, &profile_id, runtime_state, 1)
-        .into_iter()
-        .next()
-    else {
+    // #2066 round 3 (codex fix 2) — ATOMIC drain-and-claim, the same
+    // primitive the session actor uses: the in-flight claim and the pop
+    // happen under ONE state lock, so this path can never pop a one-shot it
+    // does not own. The round-2 shape (separate occupancy check → pop →
+    // claim inside the spawned task) could pop an item, lose the claim race
+    // to another dispatcher, and complete the popped item UNEXECUTED — for a
+    // latched GoalWrapUp that meant permanently dropping the wrap-up
+    // (`wrap_up_emitted` never re-mints on a budget_limited goal). A held
+    // marker now drains NOTHING here (cross-subsystem occupancy, #1529,
+    // subsumed: the claim check is inside the same lock as the pop), and the
+    // returned guard travels into the spawned turn, released on every exit.
+    let (mut drained, claim_guard) = default_agent_orchestrator()
+        .drain_and_claim_ready_continuation_for_session(
+            &goal_storage_key,
+            &profile_id,
+            runtime_state,
+            1,
+        );
+    let Some(continuation) = drained.pop() else {
+        // Nothing owned: nothing was popped, nothing to complete. The guard
+        // (if any) drops here and releases immediately.
         return false;
     };
 
@@ -20187,6 +20660,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 // enqueued under; the post-turn accountant must charge THAT
                 // record, not the plain wire id.
                 goal_session_key: SessionKey(continuation.session_id.as_str().to_owned()),
+                bound_goal_id: continuation
+                    .goal_id
+                    .as_ref()
+                    .map(|goal_id| goal_id.as_str().to_owned()),
+                claim_generation: claim_guard.as_ref().map(|guard| guard.generation()),
             })
         }
         _ => None,
@@ -20218,30 +20696,52 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // post-turn `record_goal_turn` call below (which runs with
         // real token usage).
         //
-        // #1140 codex P2 re-review #3: mark the goal session as
-        // in-flight so `due_loop_targets`'s goal sweep + the
-        // `enqueue_due_goal_continuations` enqueue path both skip
-        // it until the post-turn accountant clears it. The
-        // timestamp alone isn't enough for goal turns > 30s.
+        // #1140 codex P2 re-review #3/#4: the in-flight claim keeps
+        // `due_loop_targets`'s goal sweep + the enqueue paths off this
+        // session until the post-turn accountant finishes, and the RAII
+        // guard clears it on every exit (abort, early terminal, panic).
         //
-        // #1140 codex P1 re-review #4: use the RAII drop-guard shape
-        // so the marker is cleared even if the spawned turn task is
-        // aborted (e.g. `abort_connection_turns` on connection close)
-        // or returns through an early terminal path. The Drop becomes
-        // the single canonical clear-point (codex P2 re-review #5).
+        // #2066 round 3 (codex fix 2) — the claim is no longer taken here:
+        // it was taken ATOMICALLY WITH THE POP by
+        // `drain_and_claim_ready_continuation_for_session` and travels into
+        // this task. Claim-failure therefore pops nothing and completes
+        // nothing (the round-2 try-claim-in-task shape popped first and
+        // completed the item UNEXECUTED on claim failure — permanently
+        // dropping a latched GoalWrapUp). Held for EVERY continuation
+        // reason, matching the session actor's claim semantics.
         //
-        // GoalWrapUp doesn't go through this guard because the
-        // goal is already `budget_limited` — `due_loop_targets`'s
-        // goal sweep already excludes non-active goals, and the
-        // pending-queue sweep handles wrap-up via #1141's path.
-        let _in_flight_guard = if let Some(ref ctx) = goal_context_for_appui {
+        // The post-claim goal RECHECK stays: with the claim held, a
+        // gone/mismatched goal is genuinely cleared/replaced (not a racing
+        // dispatcher), so completing the popped item is correct — launching
+        // the drained prompt would run a turn for a deleted goal. The abort
+        // stamps the internal turn slot Terminal (no wire event was emitted
+        // for this turn yet — the client never saw it) so the session's
+        // `active_turns` slot frees for the next dispatch.
+        let _in_flight_guard = claim_guard;
+        if let Some(ref ctx) = goal_context_for_appui {
             let session_key = SessionKey(continuation.session_id.as_str().to_owned());
+            if !default_agent_orchestrator().goal_dispatch_target_matches(
+                &session_key,
+                &ctx.profile_id,
+                ctx.bound_goal_id.as_deref(),
+            ) {
+                info!(
+                    session = %params.session_id,
+                    continuation_id = continuation.id.as_u64(),
+                    "goal was cleared/replaced between drain and launch; \
+                     aborting this turn"
+                );
+                *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
+                default_agent_orchestrator().mark_continuation_completed(
+                    &continuation,
+                    Some("goal_removed_before_launch".to_owned()),
+                );
+                // The claim guard drops here, releasing the slot.
+                return;
+            }
             default_agent_orchestrator()
                 .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
-            Some(default_agent_orchestrator().goal_dispatch_in_flight_guard(session_key))
-        } else {
-            None
-        };
+        }
         // #436 P1 #2 — for a peer_send_input injection, track whether the turn
         // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
         // failed `TurnStarted`) is NOT marked completed and stays durable for
@@ -20909,7 +21409,20 @@ async fn handle_turn_interrupt(
     id: String,
     params: TurnInterruptParams,
 ) {
+    // task-turn-interrupt-steer-correlation-logs: make the interrupt's
+    // receipt, decision and ack reconstructible from the log alone.
+    crate::turn_trace::log_interrupt_received(&params.session_id, &params.turn_id);
     let outcome = decide_interrupt(active_turns, &params).await;
+    let outcome_label: String = match &outcome {
+        InterruptOutcome::Unknown => "unknown".into(),
+        InterruptOutcome::Mismatch => "mismatch".into(),
+        InterruptOutcome::AlreadyTerminal(reason) => {
+            format!("already_terminal:{}", reason.as_str())
+        }
+        InterruptOutcome::AlreadyInterrupting => "already_interrupting".into(),
+        InterruptOutcome::Captured { .. } => "captured".into(),
+    };
+    crate::turn_trace::log_interrupt_outcome(&params.session_id, &params.turn_id, &outcome_label);
     match outcome {
         InterruptOutcome::Unknown => {
             let _ = send_rpc_error(ws, Some(id), unknown_turn_error(&params.turn_id));
@@ -20947,6 +21460,15 @@ async fn handle_turn_interrupt(
             // outer turn future here — that would race with the terminal
             // emission and could lose the wire-side event.
             let result = tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, ack_rx).await;
+            crate::turn_trace::log_interrupt_ack(
+                &params.session_id,
+                &params.turn_id,
+                if matches!(result, Ok(Ok(()))) {
+                    "interrupted"
+                } else {
+                    "ack_timed_out"
+                },
+            );
             let payload = match result {
                 Ok(Ok(())) => TurnInterruptResult::interrupted_ok(),
                 Ok(Err(_)) => {
@@ -26133,7 +26655,18 @@ async fn run_m9_fixture_turn(
         topic: None,
     });
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
-        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        let _ = transition_to_terminal_settling_steers(
+            &turn_state,
+            TerminalReason::Errored,
+            None,
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+        )
+        .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -26480,6 +27013,7 @@ async fn run_m9_fixture_turn(
                     None,
                     // M9 fixtures replay canned events; no live LLM token data.
                     None,
+                    None,
                 )
                 .await;
             }
@@ -26493,6 +27027,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some((code, message.as_str())),
+                None,
                 None,
             )
             .await;
@@ -26525,6 +27060,7 @@ async fn run_m9_fixture_turn(
                     "interrupted",
                     captured_interrupt_origin(&turn_state).await.message(),
                 )),
+                None,
                 None,
             )
             .await;
@@ -27302,7 +27838,18 @@ async fn run_native_code_review_turn(
         topic: None,
     });
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
-        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        let _ = transition_to_terminal_settling_steers(
+            &turn_state,
+            TerminalReason::Errored,
+            None,
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+        )
+        .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -27328,6 +27875,7 @@ async fn run_native_code_review_turn(
                     &turn_id,
                     Some(("runtime_unavailable", message.as_str())),
                     None,
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27343,6 +27891,7 @@ async fn run_native_code_review_turn(
                     &session_id,
                     &turn_id,
                     Some(("runtime_unavailable", message.as_str())),
+                    None,
                     None,
                 )
                 .await;
@@ -27365,6 +27914,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
                 None,
             )
             .await;
@@ -27394,6 +27944,7 @@ async fn run_native_code_review_turn(
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
                 None,
+                None,
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27420,6 +27971,17 @@ async fn run_native_code_review_turn(
     let workspace_root = session_runtime.workspace_root.clone();
     let llm_provider = session_runtime.profile.llm.clone();
     let memory_store = session_runtime.profile.memory.clone();
+    // #2055 review round 2 (hole c) — the review specialists run on a FRESH
+    // snapshot registry whose supervisor used to carry no observers, so
+    // their `native_agent` registrations were invisible to the goal ledger.
+    // Wire the cached supervisor first; the snapshot below inherits the
+    // observer pair (`snapshot_excluding` → `inherit_registration_observers`).
+    wire_goal_task_row_observers_for_cached_supervisor(
+        &session_runtime.tools.supervisor(),
+        &session_id,
+        &profile_id,
+        &session_runtime.profile.data_dir,
+    );
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
     // UPCR follow-up to #1561: refresh named prompt segments (memory) on
@@ -27626,6 +28188,7 @@ async fn run_native_code_review_turn(
                     &turn_id,
                     Some(("interrupted", "review/start interrupted by client")),
                     None,
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27748,6 +28311,7 @@ async fn run_native_code_review_turn(
         // review/start scatter-join does not run a single LLM turn end
         // to end; the summary message is emitted ad-hoc. No aggregated
         // token data is in scope here.
+        None,
         None,
     )
     .await;
@@ -28744,6 +29308,19 @@ struct GoalContinuationContext {
     /// A goal turn would charge nothing (the wire key finds no scoped goal) and
     /// recur forever without ever hitting its budget.
     goal_session_key: SessionKey,
+    /// #2066 round 2 (codex R1c/R2) — the goal identity this continuation was
+    /// enqueued under (`QueuedMasterContinuation::goal_id`). Used twice: the
+    /// post-claim dispatch recheck refuses to launch when the live goal is no
+    /// longer this incarnation, and the post-turn accountant charges
+    /// goal-id-bound so a mid-turn clear(+recreate) settles the cleared
+    /// goal's tombstone instead of the replacement. `None` for legacy
+    /// persisted continuations without a stamped goal id.
+    bound_goal_id: Option<String>,
+    /// #2066 round 5 (codex fix 1) — the marker incarnation the atomic
+    /// drain-and-claim took for THIS turn. The in-flight heartbeat refreshes
+    /// generation-matched so a stale predecessor turn resuming production
+    /// can never keep a replacement turn's marker alive.
+    claim_generation: Option<u64>,
 }
 
 /// #1134 — pick the LAST non-empty assistant row after `pre` from a
@@ -29183,7 +29760,18 @@ async fn run_standalone_turn(
     // transition the turn to a terminal state so the registry doesn't keep
     // an orphaned `Active` entry.
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
-        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        let _ = transition_to_terminal_settling_steers(
+            &turn_state,
+            TerminalReason::Errored,
+            steer_buffer.as_ref(),
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+        )
+        .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -29249,6 +29837,7 @@ async fn run_standalone_turn(
             &turn_id,
             Some(("runtime_unavailable", error.as_str())),
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29298,6 +29887,7 @@ async fn run_standalone_turn(
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
                 None,
+                steer_buffer.as_ref(),
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29326,6 +29916,7 @@ async fn run_standalone_turn(
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
                 None,
+                steer_buffer.as_ref(),
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29615,7 +30206,7 @@ async fn run_standalone_turn(
     // forward `FailoverEvent`s as `router/failover` notifications for
     // the duration of this turn. The abort handle ends the forwarder
     // when the turn ends — see the `.abort()` call near
-    // `try_emit_terminal()` below.
+    // `try_emit_terminal(, steer_buffer.as_ref())` below.
     let failover_forwarder = spawn_router_failover_forwarder(
         ws.clone(),
         ledger.clone(),
@@ -29664,6 +30255,7 @@ async fn run_standalone_turn(
             // Slash-command shortcut bypasses the LLM entirely; the
             // reply is canned and no token meter ran.
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29765,17 +30357,19 @@ async fn run_standalone_turn(
         // post-spawn failure signal BEFORE `enable_persistence` so the
         // orphan-task sweep at `task_supervisor.rs:1164-1166` —
         // which can `mark_failed` resurrected tasks — does NOT
-        // silently drop the recovery turn. The gateway path drives
-        // recovery through `ActorMessage::RecoveryHint` directly into
-        // the session actor's inbox; the WS turn handler has no
-        // actor, so we re-inject the failure into the global master
-        // continuation queue (drained on every
+        // silently drop the recovery turn. We re-inject the failure
+        // into the global master continuation queue (drained on every
         // `appui_continuation_tick`). `default_agent_orchestrator()`
         // is a process-wide singleton, so the callback survives both
         // the per-turn `tool_registry` drop AND a closed WS
         // connection — on next subscribe, the queued
         // `External("spawn_only_failure")` continuation fires and
         // `master_continuation_prompt` renders the recovery body.
+        //
+        // #2020: the gateway now enqueues onto this same queue from its own
+        // `set_on_failure_signal` (it used to own a separate
+        // `ActorMessage::RecoveryHint` inbox), so both runtime modes
+        // re-enter through one transport.
         //
         // The per-connection drain filter
         // (`maybe_spawn_appui_master_continuation_runner`) takes
@@ -29860,15 +30454,87 @@ async fn run_standalone_turn(
                 Some(change_profile_id.as_str()),
             );
         });
+        // #2055 — create the goal-ledger task row at registration time,
+        // wired next to the unified terminal sink below (whose settle half,
+        // #2054, flips the row at terminal). The turn's goal binding is
+        // snapshotted HERE at wiring time, mirroring the #1650
+        // dispatch-time `interactive_goal_binding` semantics: an autonomous
+        // continuation carries `goal_context` (its goal resolves under the
+        // already-scoped store key it was enqueued with, family-2 — never
+        // re-scoped), an interactive turn uses the #1935
+        // `interactive_goal_id` snapshot. This wiring is REPLACED every
+        // turn, so a goal-less turn overwrites a prior goal turn's closure
+        // with the no-op rather than leaking a stale binding. No binding ⇒
+        // no rows — correct behavior, not an error. The recorder swallows
+        // every ledger error (registration must never fail, block, or
+        // panic on ledger I/O). The ledger lives under the PROFILE data
+        // dir (#1957 rule — never the relocatable sessions root).
+        let register_goal_binding: Option<(String, String)> = goal_context
+            .as_ref()
+            .and_then(|goal_ctx| {
+                default_agent_orchestrator()
+                    .active_goal_id_under_goal_key(&goal_ctx.goal_session_key, &goal_ctx.profile_id)
+                    .map(|goal_id| (goal_id, goal_ctx.profile_id.clone()))
+            })
+            .or_else(|| {
+                interactive_goal_id
+                    .clone()
+                    .map(|goal_id| (goal_id, goal_charge_profile.clone()))
+            });
+        // #2056 round 2 (H2b) — the RECONCILE binding is resolved separately
+        // and WITHOUT the active-only filter above. Registration is right to
+        // refuse a non-active goal (no new work should be recorded against
+        // one); reconciliation is not — a paused or budget-limited goal keeps
+        // its ledger, and its stranded rows are still wrong. Resolved at
+        // callback time, on the same keys, so a goal that leaves `active`
+        // mid-turn is still reconciled at the next restore. The profile falls
+        // back exactly like `terminal_profile_id` below, because
+        // `goal_charge_profile` degrades to `_main` on a goal-less turn.
+        let restore_goal_key = goal_context.as_ref().map(|goal_ctx| {
+            (
+                goal_ctx.goal_session_key.clone(),
+                goal_ctx.profile_id.clone(),
+            )
+        });
+        let restore_wire_key = session_id.clone();
+        let restore_wire_profile = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+        // Round 3 — the SHARED installer wires both halves (recorder +
+        // change-feed settle listener), with THIS turn's dispatch-time
+        // binding snapshot as the resolver. The settle rides the change
+        // feed as a NAMED listener (not the `on_terminal` sink below):
+        // `cancel` emits only `notify_change`, and the sink's once-per-task
+        // dedupe would swallow the owner's failed→complete correction.
+        // Inherited by nested child supervisors.
+        crate::autonomy::agent_orchestrator::install_goal_task_row_observers(
+            &task_supervisor,
+            &session_runtime.profile.data_dir,
+            move || register_goal_binding.clone(),
+            move || {
+                let orchestrator = default_agent_orchestrator();
+                if let Some((goal_key, profile)) = restore_goal_key.as_ref()
+                    && let Some(goal_id) =
+                        orchestrator.bound_goal_id_under_goal_key(goal_key, profile)
+                {
+                    return Some((goal_id, profile.clone()));
+                }
+                orchestrator
+                    .bound_goal_id(&restore_wire_key, &restore_wire_profile)
+                    .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+            },
+        );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
         // profile-resolving call into the master continuation queue. Runs
         // alongside the legacy `set_on_change` (success) and
-        // `set_on_failure_signal` (failure) wiring during the strangler
-        // migration — shared dedupe keys collapse the double delivery to one
-        // continuation. The threaded `terminal_profile_id` (mirrors
-        // `change_profile_id` / `failure_profile_id`) kills the `_main`
-        // failure-stranding by construction.
+        // `set_on_failure_signal` (failure, which still owns the deferred
+        // fail-before-ack re-emit) wiring — shared dedupe keys collapse the
+        // double delivery to one continuation. The threaded
+        // `terminal_profile_id` (mirrors `change_profile_id` /
+        // `failure_profile_id`) kills the `_main` failure-stranding by
+        // construction.
         let terminal_profile_id = active_profile_id
             .clone()
             .or_else(|| routed_profile_id.clone())
@@ -29877,10 +30543,6 @@ async fn run_standalone_turn(
             crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 Some(terminal_profile_id.as_str()),
-                // WS / standalone-turn path: the queue IS the only failure
-                // channel here (the legacy `set_on_failure_signal` enqueues
-                // the SAME dedupe key), so route both outcomes.
-                crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
             );
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
@@ -31264,6 +31926,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     Some(("profile_config_unavailable", &error.to_string())),
                     None,
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -31329,6 +31992,7 @@ async fn run_standalone_turn(
             &turn_id,
             None,
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -31359,6 +32023,7 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             Some(("voice_asr_unavailable", error_message)),
+            None,
             None,
         )
         .await;
@@ -31522,6 +32187,49 @@ async fn run_standalone_turn(
     // task future is dropped.
     let token_tracker = std::sync::Arc::new(octos_agent::TokenTracker::new());
     let token_tracker_task = std::sync::Arc::clone(&token_tracker);
+    // #2066 round 4 (codex fix 2) — the AppUI twin of the session actor's
+    // #2003 in-flight heartbeat: keep this goal turn's dispatch marker fresh
+    // WHILE the turn is genuinely producing. AppUI had NO refresh at all, so
+    // a legitimately long (>30min) goal turn's marker read stale — its settle
+    // tombstone purged before the late charge arrived, and a concurrent
+    // `/goal clear` could claim the "free" slot without parking a tombstone.
+    // Progress-gated exactly like the actor's: the refresh fires only when
+    // the shared TokenTracker has ADVANCED since the last tick, so a wedged
+    // turn stops being refreshed and ages out normally (#2003's contract).
+    // Touches the SCOPED goal store key — the key the drain claimed the
+    // marker under — not the wire session id. #2066 round 5 (codex fix 1):
+    // GENERATION-MATCHED — the refresh names the marker incarnation THIS
+    // turn's drain-and-claim took, so a stale predecessor that resumes
+    // producing after eviction can never keep a replacement turn's marker
+    // alive (no generation ⇒ no claim was taken ⇒ no heartbeat). Aborted on
+    // every exit with the turn (AbortOnDrop).
+    let _in_flight_heartbeat = goal_context.as_ref().and_then(|ctx| {
+        let claim_generation = ctx.claim_generation?;
+        let tracker = std::sync::Arc::clone(&token_tracker);
+        let marker_key = ctx.goal_session_key.clone();
+        let heartbeat = tokio::spawn(async move {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let mut last = 0_u64;
+            loop {
+                tokio::time::sleep(APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                    + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                if seen > last {
+                    last = seen;
+                    default_agent_orchestrator()
+                        .touch_goal_dispatch_in_flight_generation(&marker_key, claim_generation);
+                }
+            }
+        });
+        Some(AbortOnDrop {
+            abort: heartbeat.abort_handle(),
+        })
+    });
+    // task-turn-interrupt-steer-correlation-logs: every agent-side log line
+    // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
+    // `session`/`turn` from this span (postfix `.instrument` keeps the block
+    // itself untouched).
+    let turn_span = crate::turn_trace::turn_span(&session_id, &turn_id);
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -32237,7 +32945,7 @@ async fn run_standalone_turn(
                 let _ = progress_tx_for_result.send(error.to_string()).await;
             }
         }
-    });
+    }.instrument(turn_span));
     let _abort_guard = AbortOnDrop {
         abort: agent_task.abort_handle(),
     };
@@ -32373,26 +33081,35 @@ async fn run_standalone_turn(
         // can wake us out of `progress_rx.recv()` even if the agent task is
         // mid-await. The state mutex is the actual race winner; this select
         // is a notification, not a guard.
-        let event = tokio::select! {
-            biased;
-            _ = interrupt_rx.recv(), if !interrupt_observed => {
+        //
+        // task-interrupt-breaks-progress-wait: on `Interrupted` we BREAK
+        // right here. The old shape (`continue`, then a post-select check)
+        // re-entered the select with the interrupt arm disabled and waited
+        // for the NEXT progress event — a silent long tool (`bash sleep …`)
+        // held the terminal back until the ~8 s status_word heartbeat and the
+        // client's 5 s turn/interrupt ack timed out.
+        let event = match crate::turn_loop::next_turn_loop_step(
+            &mut interrupt_rx,
+            &mut progress_rx,
+            interrupt_observed,
+        )
+        .await
+        {
+            crate::turn_loop::TurnLoopStep::Interrupted => {
+                // The handler transitioned state to `Interrupting`. Drop any
+                // remaining progress events on the floor; they are no longer
+                // observable to the client.
                 interrupt_observed = true;
-                continue;
+                break;
             }
-            recv = progress_rx.recv() => match recv {
-                Some(data) => match serde_json::from_str::<Value>(&data) {
+            crate::turn_loop::TurnLoopStep::Closed => break,
+            crate::turn_loop::TurnLoopStep::Progress(data) => {
+                match serde_json::from_str::<Value>(&data) {
                     Ok(event) => event,
                     Err(_) => continue,
-                },
-                None => break,
+                }
             }
         };
-        if interrupt_observed {
-            // The handler transitioned state to `Interrupting`. Drop any
-            // remaining progress events on the floor; they are no longer
-            // observable to the client.
-            break;
-        }
         match event.get("type").and_then(Value::as_str) {
             Some("done") => {
                 if !saw_delta {
@@ -32501,6 +33218,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     None,
                     Some(details),
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 break;
@@ -32601,6 +33319,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     Some((code, wire_msg.as_str())),
                     None,
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 break;
@@ -32967,6 +33686,7 @@ async fn run_standalone_turn(
                 captured_interrupt_origin(&turn_state).await.message(),
             )),
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not
@@ -32985,21 +33705,34 @@ async fn run_standalone_turn(
 
     let _ = agent_task.await;
 
-    // `turn/steer` turn-end race residual (codex §5 parity): the loop keeps
-    // the turn alive for steers that land BEFORE its final EndTurn check,
-    // but a steer accepted in the narrow window between that check and this
-    // point never drains. Make the drop observable rather than silent — the
-    // registry entry is still keyed to this turn, so no later turn can
-    // consume the leftovers.
+    // `turn/steer` turn-end residual: the loop keeps the turn alive for
+    // steers that land BEFORE its final EndTurn check, but a steer accepted
+    // after that check — or, far more commonly, one accepted while a tool
+    // was running when the client then INTERRUPTED the turn (incident
+    // 2026-08-17: 32 s between accept and abort) — never drains.
+    // task-return-unconsumed-steer-inputs: the terminal gate
+    // (`transition_to_terminal_settling_steers`) already returned every
+    // leftover BEFORE the terminal frame, and the state lock in
+    // `handle_turn_steer` guarantees nothing was accepted after the flip —
+    // so this is a safety net that should find an empty buffer. If it ever
+    // does not, returning late is still better than dropping the text.
     if let Some(buffer) = steer_buffer.as_ref() {
-        let leftovers = buffer.drain();
-        if !leftovers.is_empty() {
+        let late = settle_leftover_steers(
+            buffer,
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+            interrupt_observed,
+        );
+        if late > 0 {
             warn!(
                 session = %session_id.0,
                 turn = %turn_id.0,
-                dropped = leftovers.len(),
-                "turn/steer input(s) arrived as the turn ended and were dropped; \
-                 the client should re-send (a fresh call now falls back to a new turn)"
+                late,
+                "turn/steer leftovers found AFTER the terminal gate — ordering invariant violated"
             );
         }
     }
@@ -33571,6 +34304,10 @@ async fn run_standalone_turn(
         if let Some(snapshot) = orchestrator.record_goal_turn(
             goal_key,
             &goal_ctx.profile_id,
+            // #2066 round 2 (codex R1c) — goal-id-bound charge: a mid-turn
+            // clear(+recreate) settles the cleared goal's tombstone, never
+            // the replacement goal.
+            goal_ctx.bound_goal_id.as_deref(),
             final_tokens_consumed,
             elapsed_seconds,
         ) {
@@ -33922,9 +34659,23 @@ async fn try_emit_terminal(
     turn_id: &TurnId,
     error_payload: Option<(&str, &str)>,
     completion_details: Option<TurnCompletionDetails>,
+    // task-return-unconsumed-steer-inputs: the turn's `turn/steer` buffer, if
+    // it has one. Settled (returned as `turn/steer_dropped`) after the state
+    // flips to Terminal and BEFORE the terminal frame below — see
+    // `settle_leftover_steers`.
+    steer_buffer: Option<&octos_agent::SharedSteerBuffer>,
 ) {
-    let Some(TerminalTransition { reason, ack }) =
-        transition_to_terminal(turn_state, expected_reason).await
+    // Single terminal gate: state → Terminal, then the steer settlement
+    // (`turn/steer_dropped`), then — below — the terminal frame.
+    let Some(TerminalTransition { reason, ack }) = transition_to_terminal_settling_steers(
+        turn_state,
+        expected_reason,
+        steer_buffer,
+        SteerReturnSink::Live { ws, ledger },
+        session_id,
+        turn_id,
+    )
+    .await
     else {
         return;
     };
@@ -34148,8 +34899,15 @@ async fn try_emit_completed_terminal_with_forced_backpressure(
     session_id: &SessionKey,
     turn_id: &TurnId,
 ) {
-    let Some(TerminalTransition { ack, .. }) =
-        transition_to_terminal(turn_state, TerminalReason::Completed).await
+    let Some(TerminalTransition { ack, .. }) = transition_to_terminal_settling_steers(
+        turn_state,
+        TerminalReason::Completed,
+        None,
+        SteerReturnSink::Live { ws, ledger },
+        session_id,
+        turn_id,
+    )
+    .await
     else {
         return;
     };
@@ -34812,12 +35570,14 @@ async fn abort_connection_turns(
     let mut active = active_turns.lock().await;
     for (session_id, turn_id) in turns {
         let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
+        let mut aborted_steer: Option<octos_agent::SharedSteerBuffer> = None;
         let should_abort = active
             .get(&session_id)
             .is_some_and(|active| active.turn_id == turn_id);
         if should_abort {
             if let Some(active) = active.remove(&session_id) {
                 aborted_state = Some(active.state.clone());
+                aborted_steer = active.steer.clone();
                 active.abort.abort();
             }
         }
@@ -34829,8 +35589,21 @@ async fn abort_connection_turns(
         // with a natural completion / interrupt that may already have
         // flipped state to Terminal.
         if let Some(state) = aborted_state {
-            if let Some(transition) =
-                transition_to_terminal(state.as_ref(), TerminalReason::Interrupted).await
+            // task-return-unconsumed-steer-inputs: same terminal gate as the
+            // live path — state Terminal → `turn/steer_dropped` (ledger-only:
+            // the connection is gone, the reconnecting client replays it) →
+            // terminal. Without this the aborted turn task's safety-net drain
+            // would land AFTER this terminal and a same-process reconnect
+            // would lose the steer.
+            if let Some(transition) = transition_to_terminal_settling_steers(
+                state.as_ref(),
+                TerminalReason::Interrupted,
+                aborted_steer.as_ref(),
+                SteerReturnSink::LedgerOnly { ledger },
+                &session_id,
+                &turn_id,
+            )
+            .await
             {
                 let _ = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
                     session_id: session_id.clone(),
@@ -36235,6 +37008,97 @@ fn send_raw_notification_ephemeral(
     ws.send_ephemeral(frame, method)
 }
 
+/// task-return-unconsumed-steer-inputs: where a `turn/steer_dropped` return
+/// goes. The live connection sends durably AND ledgers; a closed connection
+/// (see `abort_connection_turns`) can only ledger — the reconnecting client
+/// replays it, still ahead of the terminal.
+pub(crate) enum SteerReturnSink<'a> {
+    Live {
+        ws: &'a WsConnection,
+        ledger: &'a UiProtocolLedger,
+    },
+    LedgerOnly {
+        ledger: &'a UiProtocolLedger,
+    },
+}
+
+/// task-return-unconsumed-steer-inputs: drain whatever `turn/steer` inputs the
+/// server accepted (`steered:true`) but never fed to the loop, and return
+/// them to the client as ONE `turn/steer_dropped` notification (buffer
+/// order preserved). Sent durable — the payload is user text, so it must not
+/// be lost to backpressure — and appended to the ledger so a reconnecting
+/// client replays it. Emits nothing for an empty buffer. Returns the number
+/// of inputs returned.
+///
+/// ORDER CONTRACT (`event.turn_steer_dropped.v1`): this runs after the turn
+/// state flipped to Terminal (no more steers can be accepted) and BEFORE the
+/// terminal frame — see `transition_to_terminal_settling_steers`, the single
+/// gate every terminal outlet goes through. A client that sees the terminal
+/// without a preceding `turn/steer_dropped` naming its steer may conclude the
+/// steer was consumed.
+pub(crate) fn settle_leftover_steers(
+    buffer: &octos_agent::SharedSteerBuffer,
+    sink: SteerReturnSink<'_>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    interrupt_observed: bool,
+) -> usize {
+    let leftovers = buffer.drain();
+    let count = leftovers.len();
+    let Some(notification) = crate::steer_return::leftover_steer_notification(
+        session_id,
+        turn_id,
+        leftovers,
+        interrupt_observed,
+    ) else {
+        return 0;
+    };
+    warn!(
+        session = %session_id.0,
+        turn = %turn_id.0,
+        dropped = count,
+        interrupted = interrupt_observed,
+        "turn/steer input(s) were still pending when the turn ended; returning them \
+         to the client as turn/steer_dropped ahead of the terminal"
+    );
+    match sink {
+        SteerReturnSink::Live { ws, ledger } => {
+            let _ = send_notification_durable(ws, ledger, notification);
+        }
+        SteerReturnSink::LedgerOnly { ledger } => {
+            let _ = ledger.append_notification(notification);
+        }
+    }
+    count
+}
+
+/// task-return-unconsumed-steer-inputs: THE terminal gate. Every terminal
+/// outlet (live `try_emit_terminal`, the connection-close abort path, the
+/// early `turn/started`-failed bail-outs) flips the state through here so the
+/// `event.turn_steer_dropped.v1` order — state Terminal → steers settled →
+/// terminal frame — cannot be bypassed. Returns the transition for the caller
+/// to emit its terminal frame, or `None` if the turn was already terminal.
+async fn transition_to_terminal_settling_steers(
+    turn_state: &TokioMutex<TurnState>,
+    expected_reason: TerminalReason,
+    steer_buffer: Option<&octos_agent::SharedSteerBuffer>,
+    sink: SteerReturnSink<'_>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> Option<TerminalTransition> {
+    let transition = transition_to_terminal(turn_state, expected_reason).await?;
+    if let Some(buffer) = steer_buffer {
+        settle_leftover_steers(
+            buffer,
+            sink,
+            session_id,
+            turn_id,
+            matches!(transition.reason, TerminalReason::Interrupted),
+        );
+    }
+    Some(transition)
+}
+
 fn send_turn_error(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -36952,6 +37816,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ProgressUpdated(_)
             | UiNotification::Warning(_)
             | UiNotification::TurnError(_)
+            | UiNotification::TurnSteerDropped(_)
             // ReplayLossy references a `last_durable_cursor` belonging to
             // the events it summarises, not its own — surfacing it here
             // would re-loop the replay flag onto itself.

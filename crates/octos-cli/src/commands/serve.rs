@@ -1133,6 +1133,26 @@ impl ServeCommand {
             }
         }
 
+        // #2033 — the PEER-fleet half of boot-resume. The peer-fleet synthesis
+        // gate is edge-triggered (a peer turn terminal / a master turn
+        // terminal), which is sound inside a process but leaves a restart with
+        // no edge at all: a synthesis that was owed when the previous process
+        // exited is recovered only by the next unrelated turn — never, on a
+        // fleet whose master is idle and whose peers are done. Recompute it here
+        // for every profile, bounded to fleets whose delivered round is past
+        // their recorded mark. Enqueue-only; the global continuation drain
+        // spawned below turns it into a turn under the usual gates.
+        //
+        // Peers live under the PROFILE data dir (not the serve `data_dir`), so
+        // this walks the profile runtimes rather than a single root.
+        for (profile_id, rt) in &profile_runtimes {
+            crate::api::ui_protocol_transport::enqueue_boot_owed_peer_fleet_synthesis(
+                profile_id,
+                &rt.data_dir.join("peers"),
+            )
+            .await;
+        }
+
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
                 // Per-project session storage (opt-in, default off). When set,
@@ -1393,7 +1413,9 @@ impl ServeCommand {
             config_path: resolved_config_path.or_else(|| Some(ctx.config_home.join("config.json"))),
             watchdog_enabled: watchdog_flag.clone(),
             alerts_enabled: alerts_flag.clone(),
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
+            // task-sysinfo-proc-stat-fd-budget: no startup process snapshot,
+            // no retained /proc handles (see sysinfo_budget).
+            sysinfo: tokio::sync::Mutex::new(crate::sysinfo_budget::new_metrics_system()),
             tenant_store: crate::tenant::TenantStore::open(&data_dir)
                 .ok()
                 .map(Arc::new),
@@ -1972,13 +1994,25 @@ mod tests {
             "spawn_global_master_continuation_drain{}",
             "(state.clone());"
         );
-        let stdio_needle = format!("ui_protocol_transport::stdio_connection{}", "(state)");
+        // Anchor on the CALL, not on the module path that reaches it. The
+        // original needle was `ui_protocol::stdio_connection(state)`; #1728
+        // renamed the module to `ui_protocol_transport`, so the needle stopped
+        // matching, `find` returned `None`, and this guard has been failing
+        // ever since — unnoticed, because CI's api-feature steps are a list of
+        // hand-written name filters and `commands::serve::tests::*` matches
+        // none of them (#2029). Dropping the module prefix makes the anchor
+        // survive a rename while still pinning the one call that matters.
+        let stdio_needle = format!("::stdio_connection{}", "(state)");
         let spawn_at = src
             .find(&spawn_needle)
             .expect("the global drain spawn call must exist in serve.rs");
-        let stdio_at = src
-            .find(&stdio_needle)
-            .expect("the stdio connection call must exist in serve.rs");
+        let stdio_at = src.find(&stdio_needle).unwrap_or_else(|| {
+            panic!(
+                "the stdio connection call must exist in serve.rs — if it was \
+                 renamed, update `stdio_needle` rather than deleting this guard: \
+                 it is the only thing pinning the drain BEFORE the early return"
+            )
+        });
         assert!(
             spawn_at < stdio_at,
             "the global master-continuation drain must be spawned BEFORE the stdio \

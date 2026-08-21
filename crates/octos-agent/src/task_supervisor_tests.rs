@@ -2710,6 +2710,371 @@ fn legacy_register_returns_empty_string_on_cap_rejection() {
     );
 }
 
+/// #2056 — the restore observer fires ONCE per restore, with the table in its
+/// FINAL post-sweep state, and never for a re-enable that restores nothing.
+/// Consumers that mirror task state elsewhere (the octos-cli goal ledger) use
+/// it to notice terminal transitions the previous process never delivered, so
+/// a snapshot taken before the orphan sweep would hand them a row that is
+/// about to change and a repeat firing would re-drive work already done.
+#[test]
+fn should_fire_on_restore_once_with_the_swept_table_when_persistence_is_enabled() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let writer = TaskSupervisor::new();
+    writer.enable_persistence(&ledger_path).unwrap();
+    let orphan = writer.register("search", "call-orphan", Some("api:session"));
+    writer.mark_running(&orphan);
+    let finished = writer.register("fm_tts", "call-done", Some("api:session"));
+    writer.mark_completed(&finished, vec![]);
+    drop(writer);
+
+    type RestoredRows = Vec<(String, TaskStatus)>;
+    let observed: Arc<Mutex<Vec<RestoredRows>>> = Arc::new(Mutex::new(Vec::new()));
+    let restored = TaskSupervisor::new();
+    let sink = Arc::clone(&observed);
+    restored.set_on_restore(move |tasks| {
+        let mut rows: RestoredRows = tasks
+            .iter()
+            .map(|task| (task.id.clone(), task.status.clone()))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        sink.lock().unwrap().push(rows);
+    });
+    restored.enable_persistence(&ledger_path).unwrap();
+
+    let calls = observed.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "exactly one firing per restore");
+    let rows: std::collections::HashMap<String, TaskStatus> = calls[0].iter().cloned().collect();
+    assert_eq!(
+        rows.get(&orphan),
+        Some(&TaskStatus::Failed),
+        "the observer sees the table AFTER the orphan sweep, not before it",
+    );
+    assert_eq!(rows.get(&finished), Some(&TaskStatus::Completed));
+
+    // Re-enabling the SAME path restores nothing (the idempotence guard) and
+    // must not re-fire.
+    restored.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        observed.lock().unwrap().len(),
+        1,
+        "a no-op re-enable must not re-fire the restore observer",
+    );
+}
+
+/// #2056 round 3 (R5) — seed a ledger with one finished task and return its
+/// path, so a fresh supervisor enabling on it performs a REAL restore.
+fn seeded_restore_ledger(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let ledger_path = dir.path().join("tasks.jsonl");
+    let writer = TaskSupervisor::new();
+    writer.enable_persistence(&ledger_path).unwrap();
+    let task = writer.register("search", "call-restore-seed", Some("api:session"));
+    writer.mark_completed(&task, vec![]);
+    drop(writer);
+    ledger_path
+}
+
+/// #2056 round 3 (R5) — the missed-restore handshake delivers EXACTLY ONCE,
+/// across every sequential wiring order. Counted at the observer itself: the
+/// previous pin compared goal-ledger settle attempts, which is vacuous once
+/// the first delivery has already settled the row (a duplicate finds no
+/// candidate and writes nothing either way).
+#[test]
+fn should_deliver_a_restore_exactly_once_however_the_wiring_is_ordered() {
+    use std::sync::atomic::AtomicUsize;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = seeded_restore_ledger(&dir);
+
+    let counting_observer = || {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::clone(&calls);
+        (calls, move |_: &[BackgroundTask]| {
+            sink.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+
+    // Never restored ⇒ nothing to deliver.
+    let never_restored = TaskSupervisor::new();
+    let (calls, observer) = counting_observer();
+    never_restored.set_on_restore(observer);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a supervisor that never restored must not fire its new observer",
+    );
+
+    // Wire, then restore.
+    let wire_first = TaskSupervisor::new();
+    let (calls, observer) = counting_observer();
+    wire_first.set_on_restore(observer);
+    wire_first.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one restore, one delivery");
+    wire_first.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the idempotent re-enable restores nothing and must not re-deliver",
+    );
+
+    // Restore, then wire — the missed-restore path.
+    let restore_first = TaskSupervisor::new();
+    restore_first.enable_persistence(&ledger_path).unwrap();
+    let (calls, observer) = counting_observer();
+    restore_first.set_on_restore(observer);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "wiring after the restore must deliver the one it missed",
+    );
+
+    // Re-wiring an already-delivered supervisor — the cached-supervisor idiom
+    // re-wires at every point of use — must not deliver again.
+    let (rewire_calls, observer) = counting_observer();
+    restore_first.set_on_restore(observer);
+    assert_eq!(
+        rewire_calls.load(Ordering::SeqCst),
+        0,
+        "the pending mark was consumed by the first install",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "and the replaced observer is not re-invoked either",
+    );
+
+    // LATE inheritance onto an already-restored supervisor must consume the
+    // missed restore too. Production children inherit before enabling, so this
+    // is the path a direct assignment would silently break.
+    let parent = TaskSupervisor::new();
+    let (inherited_calls, observer) = counting_observer();
+    parent.set_on_restore(observer);
+    let late_child = TaskSupervisor::new();
+    late_child.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        inherited_calls.load(Ordering::SeqCst),
+        0,
+        "precondition: the child restored with no observer of its own",
+    );
+    late_child.inherit_registration_observers(&parent);
+    assert_eq!(
+        inherited_calls.load(Ordering::SeqCst),
+        1,
+        "inheriting an observer must deliver the restore the child missed",
+    );
+    late_child.inherit_registration_observers(&parent);
+    assert_eq!(
+        inherited_calls.load(Ordering::SeqCst),
+        1,
+        "a repeat inheritance must not re-deliver",
+    );
+}
+
+/// #2056 round 3/4 (R5) — the lost wakeup, pinned with POSITIVE EVIDENCE.
+/// The round-2 shape observed "no observer wired" under one lock, RELEASED it,
+/// and only then raised a separate flag; an installer landing in that gap
+/// wired its callback, saw the flag still clear, and delivered nothing — after
+/// which nothing ever would, because the same-path re-enable returns at the
+/// idempotence guard.
+///
+/// A cfg-gated hook runs INSIDE the slot's critical section, on exactly the
+/// branch that decides "nobody could take this", and holds it while a
+/// concurrent installer tries to wire itself. The installer must not be able
+/// to COMPLETE there — it has to block on the same mutex — and the delivery
+/// must still happen exactly once after the section is released.
+///
+/// THREE THINGS HERE ARE LOAD-BEARING. Do not "simplify" any of them.
+///
+/// 1. **The handshake runs hook-first.** The installer thread does not start
+///    until the hook says it is already inside the critical section.
+///    Signalling the other way round — installer announces, hook waits for it
+///    — lets the installer win the race: `notify_restore` then takes its
+///    `Some` branch, the hook never runs, and the test passes having exercised
+///    nothing. That is not hypothetical; it is what the first draft of this
+///    test did, and it went green in 0.01s.
+/// 2. **`hook_ran` is asserted.** It is the tripwire for exactly that failure.
+///    Without it, any future change that stops this test reaching the
+///    missed-restore branch — a different lock order, an extra early return,
+///    an observer wired earlier by a helper — converts it from a proof into a
+///    green no-op, silently.
+/// 3. **The installer ACKNOWLEDGES reaching its lock attempt, and a missing
+///    ack FAILS the test.** This is the difference between evidence and
+///    inference, and it is subtler than the two above. The second draft held
+///    the section and treated "no completion signal arrived" as proof the
+///    installer was blocked — but silence has more than one cause. On a loaded
+///    runner the installer thread can simply remain UNSCHEDULED for the whole
+///    window; then, even with the broken split handshake in place, the hook
+///    times out, the pending mark is raised afterwards, the installer runs and
+///    delivers once, and every assertion passes. The ack is what rules that
+///    out: it proves the thread was runnable and had reached the call, so a
+///    subsequent absence of completion is attributable to the lock rather than
+///    to the scheduler.
+///
+/// What the ~500ms runtime does and does not tell you: it shows the held
+/// window actually elapsed, which is necessary. It does NOT show the installer
+/// was blocked rather than merely late — only the ack does that. A version of
+/// this test that keeps the timing but drops the ack is strictly weaker than
+/// it looks.
+///
+/// Residual, stated rather than hidden: between sending the ack and reaching
+/// the mutex the installer executes a few instructions, so "blocked" is proven
+/// modulo a descheduling window of that size, backed up by the happens-after
+/// assertion that the install completed only after the hook released. Every
+/// wait is bounded — including the join — so no failure mode hangs the suite.
+#[test]
+fn should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    // How long the hook holds the critical section once the installer has
+    // acknowledged reaching its lock attempt. Generous enough that an
+    // UNBLOCKED installer would comfortably finish inside it.
+    const HELD_WINDOW: Duration = Duration::from_millis(500);
+    // Budget for the installer's "I reached the lock attempt" ack. Exceeding
+    // this FAILS the test — the run proved nothing and must say so.
+    const ACK_BUDGET: Duration = Duration::from_secs(10);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = seeded_restore_ledger(&dir);
+
+    let supervisor = TaskSupervisor::new();
+    let deliveries = Arc::new(AtomicUsize::new(0));
+    let installed_inside_the_section = Arc::new(AtomicBool::new(false));
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let installer_acked = Arc::new(AtomicBool::new(false));
+    let hook_exit_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let installed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+
+    let (inside_tx, inside_rx) = mpsc::channel::<()>();
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (installed_tx, installed_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    // `Receiver` is not `Sync`; the hook must be.
+    let reached_rx = Mutex::new(reached_rx);
+    let installed_rx = Mutex::new(installed_rx);
+
+    let observed = Arc::clone(&installed_inside_the_section);
+    let ran = Arc::clone(&hook_ran);
+    let acked = Arc::clone(&installer_acked);
+    let exit_at = Arc::clone(&hook_exit_at);
+    supervisor.set_restore_notify_hook_for_test(move || {
+        ran.store(true, Ordering::SeqCst);
+        // Release the installer only now — this section is held.
+        inside_tx.send(()).expect("installer waiting");
+        // POSITIVE evidence that the installer thread is runnable and has
+        // reached its lock attempt. Without this, the silence below is
+        // ambiguous (see the doc comment).
+        if reached_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(ACK_BUDGET)
+            .is_ok()
+        {
+            acked.store(true, Ordering::SeqCst);
+            // Having established the installer is AT the lock, it must not be
+            // able to get PAST it while this section is held.
+            if installed_rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv_timeout(HELD_WINDOW)
+                .is_ok()
+            {
+                observed.store(true, Ordering::SeqCst);
+            }
+        }
+        *exit_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    });
+
+    let installer = supervisor.clone();
+    let installer_deliveries = Arc::clone(&deliveries);
+    let installer_installed_at = Arc::clone(&installed_at);
+    let handle = std::thread::spawn(move || {
+        inside_rx.recv().expect("hook entered the critical section");
+        // Ack immediately before the call that must block.
+        reached_tx.send(()).expect("hook awaiting the ack");
+        installer.set_on_restore(move |_| {
+            installer_deliveries.fetch_add(1, Ordering::SeqCst);
+        });
+        *installer_installed_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let _ = installed_tx.send(());
+        let _ = done_tx.send(());
+    });
+
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    // Bounded completion before the (now guaranteed-immediate) join, so a
+    // regression cannot hang the suite instead of failing it.
+    done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("installer thread must finish once the section is released");
+    handle.join().expect("installer thread");
+
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "the restore must have taken the missed-restore branch, or this test \
+         proved nothing",
+    );
+    assert!(
+        installer_acked.load(Ordering::SeqCst),
+        "the installer never acknowledged reaching its lock attempt, so this \
+         run cannot distinguish 'blocked' from 'never scheduled' — the result \
+         is inconclusive, which is a failure, not a pass",
+    );
+    assert!(
+        !installed_inside_the_section.load(Ordering::SeqCst),
+        "installing an observer completed while the missed-restore decision \
+         was still being made — that gap IS the lost wakeup",
+    );
+    let exit = hook_exit_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .expect("hook recorded its exit");
+    let installed = installed_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .expect("installer recorded its completion");
+    assert!(
+        installed >= exit,
+        "the install completed before the critical section was released",
+    );
+    assert_eq!(
+        deliveries.load(Ordering::SeqCst),
+        1,
+        "the restore the installer raced must still be delivered exactly once",
+    );
+}
+
+/// #2056 — the restore observer travels with the registration observer onto
+/// child / nested supervisors, so a child that persists its own task ledger
+/// reconciles its own rows.
+#[test]
+fn should_inherit_on_restore_when_registration_observers_are_inherited() {
+    use std::sync::atomic::AtomicUsize;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("child-tasks.jsonl");
+
+    let parent = TaskSupervisor::new();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&fired);
+    parent.set_on_restore(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let child = TaskSupervisor::new();
+    child.inherit_registration_observers(&parent);
+    child.enable_persistence(&ledger_path).unwrap();
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the inherited restore observer fires on the child's own restore",
+    );
+}
+
 #[test]
 fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     // The bug: when the runtime crashes mid-task, the JSONL ledger has a
@@ -4216,4 +4581,294 @@ async fn start_reaper_loop_reaps_stuck_task_on_interval() {
             .contains("heartbeat timeout")
     );
     assert!(supervisor.cancel_token(&id).is_cancelled());
+}
+
+// ---------------------------------------------------------------------------
+// #2055 — registration observer (`set_on_register`).
+//
+// The goal-ledger task-row creation lives in octos-cli (octos-agent cannot
+// see octos-fleet), so the supervisor exposes a registration callback the
+// runtime wires next to `set_on_terminal`. Fired from `register_full`'s
+// single success path, so ONE call site covers every registration kind
+// (background/spawn_only, sub-agents, MCP, peers).
+// ---------------------------------------------------------------------------
+
+/// The observer fires exactly once per successful registration, with the
+/// freshly inserted task snapshot.
+#[test]
+fn on_register_fires_exactly_once_per_successful_registration() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let supervisor = TaskSupervisor::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<BackgroundTask>::new()));
+    let calls_c = calls.clone();
+    let seen_c = seen.clone();
+    supervisor.set_on_register(move |task| {
+        calls_c.fetch_add(1, Ordering::SeqCst);
+        seen_c.lock().unwrap().push(task.clone());
+    });
+
+    let id = supervisor.register("web_probe", "call-reg-1", Some("api:sess-reg"));
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one successful registration fires the observer exactly once"
+    );
+    let snapshots = seen.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].id, id);
+    assert_eq!(snapshots[0].tool_name, "web_probe");
+    assert_eq!(snapshots[0].tool_call_id, "call-reg-1");
+    assert_eq!(
+        snapshots[0].parent_session_key.as_deref(),
+        Some("api:sess-reg")
+    );
+
+    // Subsequent lifecycle transitions must NOT re-fire the observer.
+    supervisor.mark_running(&id);
+    supervisor.mark_completed(&id, vec![]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "on_register is a registration observer, not a change feed"
+    );
+}
+
+/// Every `register*` entry point funnels through `register_full`, so the
+/// observer covers all of them without per-entry-point wiring.
+#[test]
+fn on_register_fires_for_every_register_entry_point() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let supervisor = TaskSupervisor::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_c = calls.clone();
+    supervisor.set_on_register(move |_| {
+        calls_c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    supervisor.register("t1", "call-ep-1", Some("api:sess-ep"));
+    supervisor.register_with_lineage("t2", "call-ep-2", Some("api:sess-ep"), None);
+    supervisor.register_with_input(
+        "t3",
+        "call-ep-3",
+        Some("api:sess-ep"),
+        Some(serde_json::json!({"a": 1})),
+    );
+    supervisor.register_with_input_and_cmid("t4", "call-ep-4", Some("api:sess-ep"), None, None);
+    supervisor
+        .try_register_with_input("t5", "call-ep-5", Some("api:sess-ep"), None)
+        .expect("strict registration succeeds");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+/// The callback is invoked with NO supervisor locks held (cloned out of its
+/// own mutex first, like `notify_change`), so user code that re-enters the
+/// supervisor — the octos-cli closure resolves goal bindings and may read
+/// task state — cannot deadlock.
+#[test]
+fn on_register_callback_may_reenter_the_supervisor_without_deadlock() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let reentrant = Arc::clone(&supervisor);
+    let observed = Arc::new(std::sync::Mutex::new(Option::<usize>::None));
+    let observed_c = observed.clone();
+    supervisor.set_on_register(move |task| {
+        // Re-enter through read paths that take the `tasks` mutex.
+        let all = reentrant.get_all_tasks();
+        assert!(reentrant.get_task(&task.id).is_some());
+        *observed_c.lock().unwrap() = Some(all.len());
+    });
+
+    supervisor.register("web_probe", "call-reenter", Some("api:sess-re"));
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(1),
+        "the re-entrant read observed the freshly inserted task"
+    );
+}
+
+/// A REFUSED registration (terminal parent / fan-out cap) never fires the
+/// observer — there is no task to create a ledger row for.
+#[test]
+fn on_register_does_not_fire_for_refused_registrations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Terminal-parent refusal.
+    let supervisor = TaskSupervisor::new();
+    let parent_tcid = "call-onreg-parent";
+    let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-onreg"));
+    supervisor.mark_running(&parent);
+    supervisor.mark_failed(&parent, "orphaned across restart".to_string());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_c = calls.clone();
+    supervisor.set_on_register(move |_| {
+        calls_c.fetch_add(1, Ordering::SeqCst);
+    });
+    supervisor
+        .try_register_node_task("pipeline:analyze", parent_tcid, Some("sess-onreg"))
+        .expect_err("terminal parent refuses the child registration");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a ParentTerminal refusal must not fire on_register"
+    );
+
+    // Fan-out-cap refusal. The cap reader caches once per process
+    // (`OnceLock`), so exercise the production cap: fill it with the
+    // observer UNWIRED, wire the observer, then assert the refused
+    // overflow attempt fires nothing.
+    let cap_calls = Arc::new(AtomicUsize::new(0));
+    let cap_calls_c = cap_calls.clone();
+    let capped = TaskSupervisor::new();
+    for i in 0..MAX_CHILDREN_PER_PARENT {
+        capped
+            .try_register_with_input(
+                "tts",
+                &format!("call-cap-onreg-{i}"),
+                Some("sess-cap-onreg"),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+    }
+    capped.set_on_register(move |_| {
+        cap_calls_c.fetch_add(1, Ordering::SeqCst);
+    });
+    capped
+        .try_register_with_input(
+            "tts",
+            "call-cap-onreg-overflow",
+            Some("sess-cap-onreg"),
+            None,
+        )
+        .expect_err("overflow child exceeds the cap");
+    assert_eq!(
+        cap_calls.load(Ordering::SeqCst),
+        0,
+        "a ChildFanoutExceeded refusal must not fire on_register"
+    );
+}
+
+/// An unwired supervisor registers exactly as before — the observer hook is
+/// a no-op (the guard early-outs before taking any task snapshot).
+#[test]
+fn unwired_on_register_leaves_registration_untouched() {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor.register("web_probe", "call-unwired", Some("api:sess-unwired"));
+    assert!(!id.is_empty());
+    assert_eq!(
+        supervisor.get_task(&id).unwrap().status,
+        TaskStatus::Spawned
+    );
+}
+
+/// #2055 review round 2 — child/nested supervisors must inherit the
+/// REGISTRATION observers (`on_register` + the NAMED `on_change_listeners`
+/// map) so goal-ledger task rows cover nested subagent registries — and
+/// must NOT inherit the primary `on_change` / `on_failure` / `on_terminal`
+/// callbacks, whose wake semantics are deliberately per-instance.
+#[test]
+fn inherit_registration_observers_copies_observer_pair_but_not_wake_callbacks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let parent = TaskSupervisor::new();
+    let register_calls = Arc::new(AtomicUsize::new(0));
+    let named_calls = Arc::new(AtomicUsize::new(0));
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let terminal_calls = Arc::new(AtomicUsize::new(0));
+
+    let register_c = register_calls.clone();
+    parent.set_on_register(move |_| {
+        register_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let named_c = named_calls.clone();
+    parent.set_on_change_listener("settle", move |_| {
+        named_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let primary_c = primary_calls.clone();
+    parent.set_on_change(move |_| {
+        primary_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let terminal_c = terminal_calls.clone();
+    parent.set_on_terminal(move |_| {
+        terminal_c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let child = TaskSupervisor::new();
+    child.inherit_registration_observers(&parent);
+
+    let id = child.register("web_probe", "call-inherit-1", Some("api:sess-inherit"));
+    child.mark_running(&id);
+    child.mark_completed(&id, vec![]);
+
+    assert_eq!(
+        register_calls.load(Ordering::SeqCst),
+        1,
+        "the child inherits on_register"
+    );
+    assert!(
+        named_calls.load(Ordering::SeqCst) >= 1,
+        "the child inherits the NAMED change listeners"
+    );
+    assert_eq!(
+        primary_calls.load(Ordering::SeqCst),
+        0,
+        "the primary on_change is per-instance and must NOT be inherited"
+    );
+    assert_eq!(
+        terminal_calls.load(Ordering::SeqCst),
+        0,
+        "on_terminal is per-instance and must NOT be inherited"
+    );
+}
+
+/// #2055 review round 2 — the production nesting path: a registry snapshot
+/// (`ToolRegistry::snapshot_excluding`) mints a FRESH supervisor (the
+/// deliberate per-subtree isolation), which used to drop the registration
+/// observers entirely — nested subagent registrations were invisible to the
+/// goal ledger. The fresh supervisor now inherits the observer pair while
+/// the task maps stay isolated.
+#[test]
+fn snapshot_excluding_child_supervisor_inherits_registration_observers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let parent_registry = crate::ToolRegistry::new();
+    let register_calls = Arc::new(AtomicUsize::new(0));
+    let named_calls = Arc::new(AtomicUsize::new(0));
+    let register_c = register_calls.clone();
+    parent_registry.supervisor().set_on_register(move |_| {
+        register_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let named_c = named_calls.clone();
+    parent_registry
+        .supervisor()
+        .set_on_change_listener("settle", move |_| {
+            named_c.fetch_add(1, Ordering::SeqCst);
+        });
+
+    let child_registry = parent_registry.snapshot_excluding(&[]);
+    let child = child_registry.supervisor();
+    let id = child.register("nested_tool", "call-snap-1", Some("api:sess-snap"));
+    child.mark_running(&id);
+
+    assert_eq!(
+        register_calls.load(Ordering::SeqCst),
+        1,
+        "a registration on the snapshot's fresh supervisor reaches the parent's observer"
+    );
+    assert!(
+        named_calls.load(Ordering::SeqCst) >= 1,
+        "the named change listeners ride along onto the snapshot"
+    );
+    // The isolation contract is untouched: the child's task lives in the
+    // child's map only.
+    assert!(
+        parent_registry.supervisor().get_task(&id).is_none(),
+        "task maps stay per-subtree"
+    );
+    assert!(child.get_task(&id).is_some());
 }

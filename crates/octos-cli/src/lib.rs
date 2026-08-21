@@ -25,6 +25,22 @@ pub mod auth;
 // full `dead_code` enforcement.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod autonomy;
+/// task-return-unconsumed-steer-inputs: feature-independent shape of the
+/// `turn/steer_dropped` return (the `api` module does the sending).
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod steer_return;
+/// task-sysinfo-proc-stat-fd-budget: the one place the metrics `sysinfo::System`
+/// is constructed (handle cache off, no startup process snapshot).
+pub(crate) mod sysinfo_budget;
+/// task-interrupt-breaks-progress-wait: the standalone-turn loop's next-step
+/// race (interrupt vs progress), kept feature-independent so it is testable.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod turn_loop;
+/// task-turn-interrupt-steer-correlation-logs: session/turn-correlated
+/// lifecycle logging for turn/interrupt and turn/steer (the `api` module
+/// calls these; kept feature-independent so the shape is testable).
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod turn_trace;
 pub use octos_services::cli_agent_adapter;
 pub mod commands;
 pub use octos_services::compaction;

@@ -77,9 +77,14 @@ fn provider_policy_allows_equivalent_with_tags(
     ) {
         return false;
     }
-    if policy.require_tags.is_empty() || tool_tags.is_empty() {
+    if policy.require_tags.is_empty() {
         return true;
     }
+    // SECURITY (peer-review fix): mirror `ToolPolicy::is_allowed_with_tags`
+    // — untagged tools FAIL a non-empty `require_tags` gate (fail closed).
+    // Plugin and MCP tools never declare tags, so the old empty-tags
+    // exemption made `require_tags` a no-op for exactly the unaudited tool
+    // surface it exists to confine.
     tool_tags
         .iter()
         .any(|tag| policy.require_tags.iter().any(|required| required == tag))
@@ -626,6 +631,16 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
+    /// Return a tool's declared foreground execution budget, when it has
+    /// one. The agent dispatcher uses this before spawning a batch so plugin
+    /// manifest timeouts are not accidentally shortened by the generic
+    /// interactive-tool default.
+    pub fn execution_timeout_secs(&self, name: &str) -> Option<u64> {
+        self.tools
+            .get(name)
+            .and_then(|tool| tool.execution_timeout_secs())
+    }
+
     /// Get tool specifications for the LLM, filtered by provider policy if set.
     /// Results are cached and invalidated when the registry is mutated.
     /// Codex round 2 P2: visibility-aware tool lookup.
@@ -1015,6 +1030,11 @@ impl ToolRegistry {
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: None,
+            // Fresh per-snapshot supervisor (deliberate per-subtree
+            // isolation of task maps); #2055 review round 2 — the
+            // REGISTRATION observers are inherited right below so a nested
+            // registration still reaches the goal-ledger recorder/settle
+            // wiring installed on the parent.
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1048,6 +1068,14 @@ impl ToolRegistry {
             let cell = snapshot.live_catalog_handle();
             snapshot.register(ToolSuggestTool::new(cell));
         }
+        // #2055 review round 2 — the fresh supervisor keeps its task map
+        // isolated per-subtree, but the REGISTRATION observers (`on_register`
+        // + the named `on_change_listeners`) ride along so goal-ledger task
+        // rows cover registrations on the snapshot. Wake callbacks
+        // (`on_change`/`on_failure`/`on_terminal`) stay per-instance.
+        snapshot
+            .supervisor
+            .inherit_registration_observers(&self.supervisor);
         snapshot.refresh_live_catalog();
         snapshot
     }
@@ -2158,6 +2186,63 @@ mod registry_dispatch_tests {
         assert!(
             !reg.provider_policy_permits("shell"),
             "tools absent from a non-empty allow list must not pass the permit predicate"
+        );
+    }
+
+    /// SECURITY (peer-review finding: untagged-tool tag bypass): the
+    /// provider-policy `require_tags` gate must fail closed for untagged
+    /// tools. Plugin and MCP tools never declare tags (`tags()` defaults to
+    /// `&[]`), so the old empty-tags exemption made a `require_tags`
+    /// confinement filter a no-op for exactly the unaudited tool surface it
+    /// exists to gate — any tool that simply omitted `tags()` walked
+    /// straight through `specs()` and `is_tool_visible` to the LLM.
+    #[test]
+    fn should_fail_closed_for_untagged_tool_under_require_tags_provider_policy() {
+        // Does not override `tags()` — it models every plugin/MCP/newly
+        // added tool that ships untagged.
+        struct UntaggedStubTool;
+
+        #[async_trait::async_trait]
+        impl Tool for UntaggedStubTool {
+            fn name(&self) -> &str {
+                "untagged_stub"
+            }
+            fn description(&self) -> &str {
+                "test-only untagged tool"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+                Ok(ToolResult {
+                    output: String::new(),
+                    success: true,
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut reg = make_registry();
+        reg.register_arc(Arc::new(UntaggedStubTool));
+        reg.set_provider_policy(ToolPolicy {
+            require_tags: vec!["code".to_string()],
+            ..Default::default()
+        });
+        // A tool tagged with a matching tag stays visible (read_file is
+        // tagged ["fs", "code"]).
+        assert!(
+            reg.is_tool_visible("read_file"),
+            "a tool tagged 'code' must pass the require_tags gate"
+        );
+        // The untagged tool must be hidden from visibility and from the
+        // LLM-facing specs() output.
+        assert!(
+            !reg.is_tool_visible("untagged_stub"),
+            "untagged tools must FAIL a non-empty require_tags gate (fail closed)"
+        );
+        assert!(
+            reg.specs().iter().all(|spec| spec.name != "untagged_stub"),
+            "untagged tools must not be advertised to the LLM under require_tags"
         );
     }
 

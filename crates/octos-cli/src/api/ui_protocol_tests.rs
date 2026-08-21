@@ -1149,7 +1149,7 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
     .expect("switch dynamic profile runtime");
 
     assert_eq!(
-        load_skill_action_jobs(&profile_data_dir, &session_id)
+        load_skill_action_jobs(&profile_data_dir, "job-owner", &session_id)
             .expect("read jobs")
             .into_iter()
             .find(|job| job.job_id == task_id)
@@ -5599,6 +5599,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
         &questions,
         &forwarders,
         candidate.as_deref(),
+        None,
         features,
         "open-missing".into(),
         missing_params,
@@ -5654,6 +5655,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
         &questions,
         &forwarders,
         candidate.as_deref(),
+        None,
         features,
         "open-grace".into(),
         grace_params,
@@ -5873,6 +5875,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some(profile_id),
+            None,
             features,
             SessionOpenParams {
                 session_id: session_id.clone(),
@@ -5988,6 +5991,7 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
                 questions,
                 ConnectionId::next(),
                 Some(profile),
+                None,
                 features,
                 SessionOpenParams {
                     session_id,
@@ -6224,8 +6228,10 @@ fn panel_cron_job(id: &str, enabled: bool) -> octos_bus::CronJob {
             deliver: false,
             channel: Some("system".into()),
             chat_id: None,
+            mode: octos_bus::CronMode::Agent,
         },
         state: Default::default(),
+        origin: octos_bus::CronOrigin::default(),
         created_at_ms: 1,
         delete_after_run: false,
         timezone: None,
@@ -8776,6 +8782,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
         &turn_id,
         None,
         Some(details.clone()),
+        None,
     )
     .await;
 
@@ -8836,6 +8843,7 @@ async fn try_emit_terminal_with_no_details_omits_token_fields() {
         &ledger,
         &session_id,
         &turn_id,
+        None,
         None,
         None,
     )
@@ -10282,6 +10290,151 @@ async fn a_second_peer_round_is_not_recorded_as_summarized_unless_a_turn_actuall
     );
 }
 
+/// #2033 — a synthesis that was OWED when the process died must be evaluated at
+/// BOOT, not left waiting for the next unrelated turn.
+///
+/// The gate is EDGE-triggered: `evaluate_and_enqueue_fleet_synthesis` is reached
+/// from exactly two edges, a PEER turn terminal and a MASTER turn terminal.
+/// Normally that is enough — a deduped enqueue deliberately leaves the marks
+/// behind (#2024) and the in-flight synthesis continuation's OWN terminal is the
+/// retry edge. What has no edge at all is a process restart: if the owed round's
+/// retry edge was still in the future when the process died, nothing on the new
+/// process ever recomputes the gate.
+///
+/// Observed live (mini5 soak): a peer's round-2 terminal landed while a round-1
+/// synthesis was in flight, so the enqueue deduped and the marks stayed at
+/// `1 auditor`; the serve was then killed before that continuation reached its
+/// terminal. On restart the master session was opened and sat for 220s with the
+/// marks still at round 1 — one trivial master turn advanced them in 3s. The
+/// peer's last round is only ever written up if the user happens to type again.
+///
+/// Reconstructs exactly that on-disk state — peer delivered round 2, marks
+/// recorded at round 1, nothing in flight — and asserts the BOOT sweep fires it
+/// with NO turn edge whatsoever. The already-current fleet in the same
+/// `peers/` root must NOT be evaluated: the sweep is bounded to owed fleets.
+#[tokio::test]
+async fn boot_sweep_synthesizes_a_peer_fleet_round_left_owed_when_the_process_died() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    // Unique masters/slugs: the continuation dedupe key, its recent-claim
+    // guard, and the peer wire registry are all process-global, so shared names
+    // would collide with sibling tests in a parallel run (#2029).
+    let owed_master = "tenant-a:api:master-2033-owed";
+    let current_master = "tenant-a:api:master-2033-current";
+
+    let stage = |slug: &str, master: &str, rounds: u32| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(dir.join("originator"), master).unwrap();
+        std::fs::write(dir.join("result.md"), "findings").unwrap();
+        for round in 1..=rounds {
+            std::fs::write(dir.join(format!("result-{round}.md")), "findings").unwrap();
+        }
+    };
+    // OWED: delivered round 2, only round 1 recorded as summarized.
+    stage("auditor-2033", owed_master, 2);
+    write_peer_fleet_synthesis_marks(peers_root, owed_master, &[("auditor-2033".to_owned(), 1)])
+        .unwrap();
+    // CURRENT: delivered round 1, round 1 already summarized. Nothing owed.
+    stage("scribe-2033", current_master, 1);
+    write_peer_fleet_synthesis_marks(peers_root, current_master, &[("scribe-2033".to_owned(), 1)])
+        .unwrap();
+
+    // Precondition: the owed fleet's record is genuinely behind its delivery.
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, owed_master),
+            "auditor-2033",
+            2
+        ),
+        1,
+        "precondition: the round-2 delivery is recorded as summarized only through round 1",
+    );
+
+    // The BOOT sweep — no peer terminal, no master terminal, no client.
+    let evaluated = enqueue_boot_owed_peer_fleet_synthesis(MAIN_PROFILE_ID, peers_root).await;
+
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, owed_master),
+            "auditor-2033",
+            2
+        ),
+        2,
+        "boot must enqueue the owed synthesis and advance the marks; without a \
+         boot-time evaluation the round waits for an unrelated turn, forever on \
+         a quiet fleet",
+    );
+    assert_eq!(
+        evaluated, 1,
+        "exactly the OWED fleet is evaluated; a fleet with nothing new must not \
+         be re-evaluated (the sweep is bounded to owed fleets, not a full scan)",
+    );
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, current_master),
+            "scribe-2033",
+            1
+        ),
+        1,
+        "an already-summarized fleet is untouched by the boot sweep",
+    );
+}
+
+/// #2033 — the boot sweep only decides WHICH fleets to look at; whether one
+/// fires stays with the shared gate.
+///
+/// "Owed" (a delivered round past the recorded mark) is a strictly weaker
+/// condition than "ready": it says nothing about the other peers in the fleet.
+/// A sweep that wrote the marks itself — or that treated owed as fire — would
+/// summarize a fleet mid-flight and, because the marks advance, never write up
+/// the sibling's work at all. Here one peer is owed at round 2 while a sibling
+/// has not delivered anything, so the fleet must be selected and then HELD.
+#[tokio::test]
+async fn boot_sweep_selects_an_owed_peer_fleet_but_leaves_the_fire_decision_to_the_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-2033-unfinished";
+
+    // Owed: delivered round 2, recorded at round 1.
+    let delivered = peers_root.join("auditor-2033-unfinished");
+    std::fs::create_dir_all(&delivered).unwrap();
+    std::fs::write(delivered.join("brief.md"), "brief").unwrap();
+    std::fs::write(delivered.join("originator"), master).unwrap();
+    std::fs::write(delivered.join("result.md"), "findings").unwrap();
+    std::fs::write(delivered.join("result-1.md"), "findings").unwrap();
+    std::fs::write(delivered.join("result-2.md"), "findings").unwrap();
+    // Sibling in the SAME fleet with no result at all — the fleet is not done.
+    let pending = peers_root.join("scribe-2033-unfinished");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("brief.md"), "brief").unwrap();
+    std::fs::write(pending.join("originator"), master).unwrap();
+    write_peer_fleet_synthesis_marks(
+        peers_root,
+        master,
+        &[("auditor-2033-unfinished".to_owned(), 1)],
+    )
+    .unwrap();
+
+    let evaluated = enqueue_boot_owed_peer_fleet_synthesis(MAIN_PROFILE_ID, peers_root).await;
+
+    assert_eq!(
+        evaluated, 1,
+        "the fleet IS owed, so the sweep must hand it to the gate",
+    );
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, master),
+            "auditor-2033-unfinished",
+            2
+        ),
+        1,
+        "the gate holds an unfinished fleet, so the boot sweep must not advance \
+         the marks — advancing them here would lose the sibling's round entirely",
+    );
+}
+
 /// Bug 2 (reset edge) — `collect_owned_peer_results` distinguishes a
 /// genuinely-EMPTY readable directory (`Some(vec![])`) from a `peers/` scan
 /// FAILURE (`None`), so a transient read error is never mistaken for a cleared
@@ -11007,6 +11160,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11077,6 +11231,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11192,6 +11347,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11262,6 +11418,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11325,6 +11482,7 @@ fn shell_approval_still_emits_risk_field() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11431,6 +11589,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -12764,8 +12923,1331 @@ fn skill_action_job_events_are_visible_only_to_their_profile() {
         },
     ));
 
-    assert!(ledger_event_matches_profile_scope(&event, "profile-a"));
-    assert!(!ledger_event_matches_profile_scope(&event, "profile-b"));
+    assert!(ledger_event_matches_profile_scope(
+        &event,
+        Some("profile-a")
+    ));
+    assert!(!ledger_event_matches_profile_scope(
+        &event,
+        Some("profile-b")
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// #2067 — cross-profile goal frames must not cross the profile scope filter.
+//
+// `SessionGoalUpdated` / `SessionGoalCleared` are appended DURABLY (the
+// `record_autonomy_rpc_evidence` -> `send_notification_durable` path at the raw
+// autonomy RPC dispatch), so they reach every connection subscribed to the wire
+// session key through all three delivery boundaries: the `replay.retain` in
+// `open_session_result`, the session/open replay send loop, and the live
+// forwarder pump. Before the fix all three passed them through `_ => true`.
+// ---------------------------------------------------------------------------
+
+/// A durable `session/goal/updated` for `profile_id`. `None` models a LEGACY
+/// row: the wire field is `skip_serializing_if = "Option::is_none"`, so a
+/// ledger line written by a backend that predates the profile stamp decodes
+/// back as `None`.
+fn goal_updated_notification(
+    session_id: &SessionKey,
+    profile_id: Option<&str>,
+    objective: &str,
+) -> UiNotification {
+    UiNotification::SessionGoalUpdated(octos_core::ui_protocol::SessionGoalUpdatedEvent {
+        session_id: session_id.clone(),
+        profile_id: profile_id.map(ToOwned::to_owned),
+        goal: octos_core::ui_protocol::UiGoalRecord {
+            profile_id: profile_id.map(ToOwned::to_owned),
+            goal_id: format!("goal-{objective}"),
+            objective: objective.to_owned(),
+            status: "active".to_owned(),
+            token_budget: 1_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+        transition_actor: "user".to_owned(),
+        generation: 0,
+    })
+}
+
+/// A durable `session/goal/cleared` for `profile_id`. The clear RPC emits
+/// `"goal": null`, so the nested record is absent and the top-level
+/// `profile_id` is the only scope the frame carries.
+fn goal_cleared_notification(session_id: &SessionKey, profile_id: Option<&str>) -> UiNotification {
+    UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+        session_id: session_id.clone(),
+        profile_id: profile_id.map(ToOwned::to_owned),
+        cleared: true,
+        goal: None,
+        transition_actor: "user".to_owned(),
+        generation: 0,
+    })
+}
+
+/// Drain every frame `handle_session_open` queued, up to and including the
+/// `session/open` NOTIFICATION it direct-sends last (distinguished from the
+/// RPC result frame by having no `id`). Frames the replay loop filtered out
+/// simply never appear.
+async fn drain_session_open_frames(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("session/open frames arrive within the timeout")
+            .expect("ws stays open");
+        let WsMessage::Text(text) = &frame else {
+            panic!("expected a text frame, got {frame:?}");
+        };
+        let value: Value = serde_json::from_str(text).expect("json frame");
+        let opened = value.get("id").is_none()
+            && value.get("method").and_then(Value::as_str)
+                == Some(octos_core::ui_protocol::methods::SESSION_OPEN);
+        frames.push(value);
+        if opened {
+            return frames;
+        }
+    }
+}
+
+/// The `objective` of every `session/goal/updated` frame in `frames`, in order.
+fn replayed_goal_objectives(frames: &[Value]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").and_then(Value::as_str)
+                == Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED)
+        })
+        .map(|frame| {
+            frame["params"]["goal"]["objective"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The `profile_id` of every `session/goal/cleared` frame in `frames`.
+fn replayed_cleared_profiles(frames: &[Value]) -> Vec<Value> {
+    frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").and_then(Value::as_str)
+                == Some(octos_core::ui_protocol::methods::SESSION_GOAL_CLEARED)
+        })
+        .map(|frame| frame["params"]["profile_id"].clone())
+        .collect()
+}
+
+/// Read the next frame, or `None` when nothing arrives within `ms`.
+async fn next_frame_within(rx: &mut mpsc::Receiver<WsMessage>, ms: u64) -> Option<Value> {
+    match tokio::time::timeout(std::time::Duration::from_millis(ms), rx.recv()).await {
+        Ok(Some(WsMessage::Text(text))) => Some(serde_json::from_str(&text).expect("json frame")),
+        Ok(other) => panic!("expected a text frame, got {other:?}"),
+        Err(_) => None,
+    }
+}
+
+/// #2067 boundary 1 (retained events): `open_session_result`'s `replay.retain`
+/// must strip a durable goal frame bound to another profile before the outcome
+/// is ever handed to the send loop.
+#[tokio::test]
+async fn should_retain_only_same_profile_goal_events_when_open_session_result_replays() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let ledger = UiProtocolLedger::new(64);
+    let approvals = PendingApprovalStore::default();
+    // A SHARED, unprofiled wire key: `validate_authenticated_session_scope`
+    // accepts a bare `web-N` id under profile auth, so two tenants can open it.
+    let session_id = SessionKey("web-shared-retain".into());
+
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "beta secret objective",
+    ));
+    ledger.append_notification(goal_cleared_notification(&session_id, Some("beta")));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("alpha"),
+        "alpha objective",
+    ));
+
+    let outcome = open_session_result(
+        &state,
+        &ledger,
+        &approvals,
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some("alpha"),
+        Some("alpha"),
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+    )
+    .await
+    .expect("alpha opens the shared session");
+
+    assert_eq!(outcome.profile_scope.as_deref(), Some("alpha"));
+    let retained: Vec<&str> = outcome
+        .replay
+        .iter()
+        .map(|event| ledger_event_method(&event.event))
+        .collect();
+    assert!(
+        !retained.contains(&octos_core::ui_protocol::methods::SESSION_GOAL_CLEARED),
+        "profile-b `session/goal/cleared` must not survive the retain filter: {retained:?}"
+    );
+    let objectives: Vec<String> = outcome
+        .replay
+        .iter()
+        .filter_map(|event| match &event.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::SessionGoalUpdated(goal)) => {
+                Some(goal.goal.objective.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        objectives,
+        vec!["alpha objective".to_owned()],
+        "only alpha's goal may be retained for an alpha-scoped open"
+    );
+}
+
+/// #2067 boundaries 2 and 3 (session/open replay send loop + live forwarder):
+/// neither may put profile-b's durable goal frames on a profile-a connection.
+#[tokio::test]
+async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-live".into());
+
+    // Durable history on the SHARED wire key, laid down before alpha connects.
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "beta secret objective",
+    ));
+    ledger.append_notification(goal_cleared_notification(&session_id, Some("beta")));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("alpha"),
+        "alpha objective",
+    ));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        Some("alpha"),
+        ConnectionUiFeatures::default(),
+        "open-alpha".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    // Boundary 2 — the replay send loop.
+    let frames = drain_session_open_frames(&mut rx).await;
+    assert_eq!(
+        replayed_goal_objectives(&frames),
+        vec!["alpha objective".to_owned()],
+        "replay must not put profile-b's objective on an alpha-scoped connection"
+    );
+    assert!(
+        replayed_cleared_profiles(&frames).is_empty(),
+        "replay must not put profile-b's `session/goal/cleared` on an alpha connection"
+    );
+
+    // Boundary 3 — the live forwarder pump.
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "beta live objective",
+    ));
+    ledger.append_notification(goal_cleared_notification(&session_id, Some("beta")));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("alpha"),
+        "alpha live objective",
+    ));
+
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("alpha's own live goal frame must still be forwarded");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED),
+        "the only live goal frame alpha may see is its own: {live}"
+    );
+    assert_eq!(
+        live["params"]["goal"]["objective"],
+        json!("alpha live objective")
+    );
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "no further live frames may reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 compatibility: an unprofiled connection must keep every frame it has
+/// today. It resolves to `_main`, every goal emitter stamps `_main` explicitly
+/// for an unprofiled deployment, and a LEGACY row predating the stamp carries
+/// no `profile_id` at all.
+///
+/// Such a connection is also not FILTERED at all — it has no frozen profile
+/// pin, so its session scope is not a tenant boundary (see
+/// `ledger_event_matches_profile_scope`) — which is why the foreign frame below
+/// is delivered too. That costs no isolation: an unscoped connection is an
+/// admin/operator authorized for every profile. The isolation guarantee lives
+/// on authenticated connections, pinned by the `should_drop_cross_profile_*`
+/// tests.
+#[tokio::test]
+async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-unprofiled".into());
+
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some(MAIN_PROFILE_ID),
+        "main objective",
+    ));
+    // Legacy row: no `profile_id` on the wire at all.
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        None,
+        "legacy objective",
+    ));
+    ledger.append_notification(goal_cleared_notification(&session_id, None));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "beta secret objective",
+    ));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        "open-main".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(
+        opened,
+        "an unprofiled connection must still open the session"
+    );
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    assert_eq!(
+        replayed_goal_objectives(&frames),
+        vec![
+            "main objective".to_owned(),
+            "legacy objective".to_owned(),
+            "beta secret objective".to_owned(),
+        ],
+        "an unfiltered connection keeps `_main`, legacy unstamped AND foreign goal frames"
+    );
+    assert_eq!(
+        replayed_cleared_profiles(&frames),
+        vec![Value::Null],
+        "a legacy `session/goal/cleared` with no profile must still be replayed"
+    );
+
+    // Live forwarder: same compatibility contract on the live path.
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "beta live objective",
+    ));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        None,
+        "legacy live objective",
+    ));
+
+    let mut live_objectives: Vec<String> = Vec::new();
+    while let Some(frame) = next_frame_within(&mut rx, 500).await {
+        if frame.get("method").and_then(Value::as_str)
+            == Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED)
+        {
+            live_objectives.push(
+                frame["params"]["goal"]["objective"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(
+        live_objectives,
+        vec![
+            "beta live objective".to_owned(),
+            "legacy live objective".to_owned(),
+        ],
+        "the live path applies the same no-filter contract as replay"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// A durable `loop/updated` shaped like the one `loop/pause`, `loop/resume`
+/// and `loop/delete` produce: the RPC result omits the top-level `profile_id`,
+/// so the nested `loop` record is the ONLY thing that names the owner.
+fn loop_updated_notification_without_top_level_profile(
+    session_id: &SessionKey,
+    record_profile_id: Option<&str>,
+    loop_id: &str,
+) -> UiNotification {
+    UiNotification::LoopUpdated(octos_core::ui_protocol::LoopUpdatedEvent {
+        session_id: session_id.clone(),
+        profile_id: None,
+        loop_id: Some(loop_id.to_owned()),
+        loop_state: octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.to_owned(),
+            session_id: session_id.clone(),
+            profile_id: record_profile_id.map(ToOwned::to_owned),
+            prompt: format!("{loop_id} prompt"),
+            mode: "interval".to_owned(),
+            interval_seconds: Some(60),
+            status: "paused".to_owned(),
+            next_run_at_ms: None,
+            last_run_at_ms: None,
+            expires_at_ms: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+        ok: Some(true),
+        status: Some("paused".to_owned()),
+        deleted: None,
+    })
+}
+
+/// A durable `monitor/updated`, which DOES carry the top-level stamp.
+fn monitor_updated_notification(
+    session_id: &SessionKey,
+    profile_id: Option<&str>,
+    monitor_id: &str,
+) -> UiNotification {
+    UiNotification::MonitorUpdated(octos_core::ui_protocol::MonitorUpdatedEvent {
+        session_id: session_id.clone(),
+        profile_id: profile_id.map(ToOwned::to_owned),
+        monitor_id: Some(monitor_id.to_owned()),
+        monitor_state: octos_core::ui_protocol::UiMonitorRecord {
+            monitor_id: monitor_id.to_owned(),
+            session_id: session_id.clone(),
+            profile_id: profile_id.map(ToOwned::to_owned),
+            name: monitor_id.to_owned(),
+            argv: vec![
+                "tail".to_owned(),
+                "-f".to_owned(),
+                "/var/log/secret".to_owned(),
+            ],
+            filter_regex: None,
+            mode: "stream".to_owned(),
+            interval_seconds: None,
+            batch_ms: 250,
+            max_events_per_hour: 60,
+            persistent: false,
+            status: "active".to_owned(),
+            pause_reason: None,
+            goal_id: None,
+            last_fired_at_ms: None,
+            fires_used: 0,
+            expires_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+        ok: Some(true),
+        status: Some("active".to_owned()),
+        deleted: None,
+    })
+}
+
+/// #2067 — the `loop/*` and `monitor/*` frames ride the SAME durable dispatch
+/// as the goal frames (`record_autonomy_rpc_evidence` ->
+/// `send_notification_durable`) and carry the same class of tenant text (loop
+/// prompt, monitor argv). They must be scoped the same way — including the
+/// `loop/pause`-shaped event whose top-level `profile_id` is absent and whose
+/// only owner stamp is the nested `loop` record.
+#[tokio::test]
+async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scopes_another_profile()
+{
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-autonomy".into());
+
+    ledger.append_notification(loop_updated_notification_without_top_level_profile(
+        &session_id,
+        Some("beta"),
+        "loop-beta",
+    ));
+    ledger.append_notification(monitor_updated_notification(
+        &session_id,
+        Some("beta"),
+        "monitor-beta",
+    ));
+    ledger.append_notification(loop_updated_notification_without_top_level_profile(
+        &session_id,
+        Some("alpha"),
+        "loop-alpha",
+    ));
+    ledger.append_notification(monitor_updated_notification(
+        &session_id,
+        Some("alpha"),
+        "monitor-alpha",
+    ));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        Some("alpha"),
+        ConnectionUiFeatures::default(),
+        "open-alpha-autonomy".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    let replayed: Vec<(String, String)> = frames
+        .iter()
+        .filter_map(|frame| {
+            let method = frame.get("method").and_then(Value::as_str)?;
+            match method {
+                octos_core::ui_protocol::methods::LOOP_UPDATED => Some((
+                    method.to_owned(),
+                    frame["params"]["loop"]["loop_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )),
+                octos_core::ui_protocol::methods::MONITOR_UPDATED => Some((
+                    method.to_owned(),
+                    frame["params"]["monitor"]["monitor_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![
+            (
+                octos_core::ui_protocol::methods::LOOP_UPDATED.to_owned(),
+                "loop-alpha".to_owned()
+            ),
+            (
+                octos_core::ui_protocol::methods::MONITOR_UPDATED.to_owned(),
+                "monitor-alpha".to_owned()
+            ),
+        ],
+        "replay must deliver only alpha's loop/monitor frames"
+    );
+
+    // Live forwarder: `loop/fired` and `monitor/fired` are stamped at the
+    // scheduler drain, so they always carry a concrete top-level profile.
+    ledger.append_notification(UiNotification::LoopFired(
+        octos_core::ui_protocol::LoopFiredEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("beta".to_owned()),
+            loop_id: "loop-beta".to_owned(),
+            loop_state: None,
+            fire: None,
+            ok: Some(true),
+            status: Some("queued".to_owned()),
+        },
+    ));
+    ledger.append_notification(UiNotification::MonitorFired(
+        octos_core::ui_protocol::MonitorFiredEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("beta".to_owned()),
+            monitor_id: "monitor-beta".to_owned(),
+            name: Some("monitor-beta".to_owned()),
+            line_count: Some(3),
+            fired_at_ms: None,
+        },
+    ));
+    ledger.append_notification(UiNotification::MonitorFired(
+        octos_core::ui_protocol::MonitorFiredEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("alpha".to_owned()),
+            monitor_id: "monitor-alpha".to_owned(),
+            name: Some("monitor-alpha".to_owned()),
+            line_count: Some(1),
+            fired_at_ms: None,
+        },
+    ));
+
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("alpha's own live monitor frame must still be forwarded");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::MONITOR_FIRED),
+        "the only live autonomy frame alpha may see is its own: {live}"
+    );
+    assert_eq!(live["params"]["monitor_id"], json!("monitor-alpha"));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "beta's live loop/monitor frames must not reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 2 (H2) — a forwarder's profile scope must be captured PER
+/// FORWARDER, exactly like `topic_scope`.
+///
+/// The pump originally read a single `live_profile_id` cell on `WsConnection`
+/// that every `session/open` overwrote, while a connection keeps one forwarder
+/// PER SESSION — so opening a second session under another profile retargeted
+/// the first session's pump. The scope is now a `spawn_live_forwarder`
+/// parameter, owned by the spawned task.
+///
+/// Driven at the forwarder boundary because that is where the invariant lives:
+/// round 4 made an unscoped connection non-filterable, and an AUTHENTICATED
+/// connection forces every session it opens to the one frozen profile, so no
+/// `session/open` sequence can exhibit two live scopes on one connection any
+/// more. The invariant still has to hold — it becomes load-bearing again the
+/// moment the scope-resolution divergence in #2081 is closed.
+#[tokio::test]
+async fn should_scope_each_forwarder_independently_when_one_connection_pumps_two_profiles() {
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_alpha = SessionKey("web-alpha-session".into());
+    let session_beta = SessionKey("web-beta-session".into());
+
+    for (session_id, profile_id) in [(&session_alpha, "alpha"), (&session_beta, "beta")] {
+        let live_rx = ledger.subscribe(session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            ConnectionUiFeatures::default(),
+            None,
+            Some(profile_id.to_owned()),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+    }
+
+    // Each forwarder keeps its OWN scope: the second spawn must not retarget
+    // the first, in either direction.
+    ledger.append_notification(goal_updated_notification(
+        &session_alpha,
+        Some("alpha"),
+        "alpha objective",
+    ));
+    ledger.append_notification(goal_updated_notification(
+        &session_beta,
+        Some("beta"),
+        "beta objective",
+    ));
+    // …and each still rejects the other's profile on its own stream.
+    ledger.append_notification(goal_updated_notification(
+        &session_alpha,
+        Some("beta"),
+        "beta objective on alpha's session",
+    ));
+    ledger.append_notification(goal_updated_notification(
+        &session_beta,
+        Some("alpha"),
+        "alpha objective on beta's session",
+    ));
+
+    let mut delivered: Vec<(String, String)> = Vec::new();
+    while let Some(frame) = next_frame_within(&mut rx, 500).await {
+        if frame.get("method").and_then(Value::as_str)
+            == Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED)
+        {
+            delivered.push((
+                frame["params"]["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                frame["params"]["goal"]["objective"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ));
+        }
+    }
+    delivered.sort();
+    assert_eq!(
+        delivered,
+        vec![
+            (session_alpha.0.clone(), "alpha objective".to_owned()),
+            (session_beta.0.clone(), "beta objective".to_owned()),
+        ],
+        "each forwarder must apply its own captured scope, not a shared one"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 2 (H4) — `session/open` is ledger-appended for BROADCAST
+/// (`open_session_result` tags it with the opening connection id precisely so
+/// other connections observe it), and it carries `workspace_root`, the context
+/// snapshot and pane snapshots. On a shared wire key those are another
+/// tenant's paths and buffers.
+///
+/// Filtering it cannot starve its own opener: the opener's forwarder skips the
+/// broadcast copy via `from_connection`, and its own frame arrives through the
+/// UNFILTERED `send_ledger_event_durable` direct send at the end of
+/// `handle_session_open`. And the scopes agree by construction —
+/// `active_profile_id` is the same `Option` that `ledger_profile_id` is
+/// `unwrap_or(_main)`-ed from, which is exactly how this filter normalizes.
+#[tokio::test]
+async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_another_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-opened".into());
+
+    let beta_opened = |workspace_root: &str| {
+        UiNotification::SessionOpened(SessionOpened {
+            session_id: session_id.clone(),
+            active_profile_id: Some("beta".to_owned()),
+            workspace_root: Some(workspace_root.to_owned()),
+            context: None,
+            context_state: None,
+            cursor: None,
+            panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
+        })
+    };
+
+    // Beta opened this shared key first; its open frame is durable history.
+    ledger.append_notification(beta_opened("/home/beta/secret-workspace"));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        Some("alpha"),
+        ConnectionUiFeatures::default(),
+        "open-alpha-shared".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    // The drain stops at the first `session/open` NOTIFICATION. Alpha must see
+    // exactly one — its own — and never beta's workspace root.
+    let frames = drain_session_open_frames(&mut rx).await;
+    let opened_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| {
+            frame.get("id").is_none()
+                && frame.get("method").and_then(Value::as_str)
+                    == Some(octos_core::ui_protocol::methods::SESSION_OPEN)
+        })
+        .collect();
+    assert_eq!(
+        opened_frames.len(),
+        1,
+        "alpha must receive exactly one session/open notification: {frames:#?}"
+    );
+    assert_eq!(
+        opened_frames[0]["params"]["active_profile_id"],
+        json!("alpha"),
+        "the session/open alpha receives must be its OWN, not beta's replayed frame"
+    );
+
+    // Live: beta re-opens the shared key from another connection.
+    ledger.append_notification(beta_opened("/home/beta/second-workspace"));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "beta's live session/open must not reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 2 (H4) — `background/activity` carries RAW observed text (a
+/// monitor's stdout lines, a fleet summary) and the ledger is its ENTIRE
+/// delivery mechanism: the sink appends it over a detached `WsConnection`
+/// whose writer is drained to nowhere, so every real client gets it from
+/// replay or its live forwarder — both of which run this filter.
+///
+/// Filtering is safe because no production emitter passes `None`: the monitor
+/// origin stamps `AutonomyMonitorRecord.profile_id` and the fleet origin
+/// stamps `FleetRecord.profile_id`, both concrete and both normalized through
+/// `resolve_autonomy_profile_id`. The monitor origin in particular carries the
+/// SAME id as `monitor/fired`, which is already filtered — so this arm adds no
+/// new starvation surface for it.
+#[tokio::test]
+async fn should_drop_cross_profile_background_activity_frames_when_connection_scopes_another_profile()
+ {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-activity".into());
+    // `background/activity` is capability-gated; negotiate it or the frames
+    // never reach the wire for reasons unrelated to profile scope.
+    let features = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+
+    let activity = |profile_id: &str, text: &str| {
+        UiNotification::BackgroundActivity(octos_core::ui_protocol::BackgroundActivityEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(profile_id.to_owned()),
+            origin_kind: "monitor".to_owned(),
+            origin_id: format!("monitor-{profile_id}"),
+            origin_label: Some(format!("{profile_id}-tail")),
+            text: text.to_owned(),
+            emitted_at_ms: 1_760_000_000_000,
+            dropped_count: None,
+            suppressed: false,
+        })
+    };
+
+    ledger.append_notification(activity("beta", "beta secret log line"));
+    ledger.append_notification(activity("alpha", "alpha log line"));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        Some("alpha"),
+        features,
+        "open-alpha-activity".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    let replayed: Vec<String> = frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").and_then(Value::as_str)
+                == Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY)
+        })
+        .map(|frame| {
+            frame["params"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec!["alpha log line".to_owned()],
+        "replay must not put another tenant's observed text on an alpha connection"
+    );
+
+    // Live forwarder leg.
+    ledger.append_notification(activity("beta", "beta live log line"));
+    ledger.append_notification(activity("alpha", "alpha live log line"));
+
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("alpha's own live activity must still be forwarded");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+        "the only live activity frame alpha may see is its own: {live}"
+    );
+    assert_eq!(live["params"]["text"], json!("alpha live log line"));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "beta's live activity must not reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 3 — the connection's resolved session scope is NOT a tenant
+/// boundary on a routed admin connection, and using it as a delivery filter
+/// starves that connection.
+///
+/// `validate_session_scope` never consults `routed_profile_id`
+/// (`ui_protocol_transport.rs:16694`), but the turn path resolves its runtime
+/// from `connection_profile_id.or(routed_profile_id)`. So an admin connection
+/// (`connection_profile_id == None`) routed to tenant `beta` by `Host`
+/// subdomain or `X-Profile-Id` opens a bare session key that resolves to
+/// `_main`, while its own turns run under `beta`'s `ProfileRuntime` — and the
+/// model tools that runtime registers hard-bind `beta` onto every record they
+/// create (`runtime/profile.rs:1321` -> `goal_tool.rs:1802`). The durable
+/// frames those records later emit are stamped `beta`, so a `_main` filter
+/// drops the connection's OWN data.
+///
+/// Round 4 generalised the guard: an unscoped connection has no frozen profile
+/// pin at all, however it was routed, so it is never filtered. This case is
+/// what motivated that guard, and it still pins it across three variants at
+/// once.
+///
+/// `background/activity` is the worst case: its sink appends over a detached
+/// connection whose writer is discarded, so replay and live forwarding are its
+/// only delivery paths — a filter drop there is total.
+#[tokio::test]
+async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_authoritative() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // A BARE key on an admin connection: `validate_session_scope` resolves it
+    // to `_main` even though the turn will run as `beta`.
+    let session_id = SessionKey("web-routed-admin".into());
+    let features = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+
+    let monitor_fired = |monitor_id: &str| {
+        UiNotification::MonitorFired(octos_core::ui_protocol::MonitorFiredEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("beta".to_owned()),
+            monitor_id: monitor_id.to_owned(),
+            name: Some(monitor_id.to_owned()),
+            line_count: Some(1),
+            fired_at_ms: None,
+        })
+    };
+    let activity = |text: &str| {
+        UiNotification::BackgroundActivity(octos_core::ui_protocol::BackgroundActivityEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("beta".to_owned()),
+            origin_kind: "monitor".to_owned(),
+            origin_id: "monitor-model-made".to_owned(),
+            origin_label: Some("ci-tail".to_owned()),
+            text: text.to_owned(),
+            emitted_at_ms: 1_760_000_000_000,
+            dropped_count: None,
+            suppressed: false,
+        })
+    };
+
+    // Durable history produced by THIS connection's own model-created monitor.
+    ledger.append_notification(monitor_fired("monitor-model-made"));
+    ledger.append_notification(activity("replayed log line"));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "routed objective",
+    ));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        // Admin / unscoped: no authenticated profile …
+        None,
+        // … and therefore no frozen profile pin either, however the connection
+        // was routed. The WS handler passes `connection_profile_id` for both.
+        None,
+        features,
+        "open-routed-admin".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "a routed admin connection must be able to open");
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    let methods: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+        .collect();
+    assert!(
+        methods.contains(&octos_core::ui_protocol::methods::MONITOR_FIRED),
+        "the connection's own routed monitor/fired must be replayed: {methods:?}"
+    );
+    assert!(
+        methods.contains(&octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+        "background/activity has no other delivery path and must be replayed: {methods:?}"
+    );
+    assert!(
+        methods.contains(&octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED),
+        "the connection's own routed goal frame must be replayed: {methods:?}"
+    );
+
+    // Same property on the live forwarder.
+    ledger.append_notification(activity("live log line"));
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("a routed admin connection must keep receiving its own live frames");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+    );
+    assert_eq!(live["params"]["text"], json!("live log line"));
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 4 — an UNSCOPED connection's per-session scope diverges from the
+/// profile its own turns run under, with no routing header involved.
+///
+/// `session_open_profile_id` is a single per-connection cell overwritten by
+/// every successful open, and every later `turn/start` — including one on an
+/// EARLIER session — receives that latest value and selects that runtime. So:
+/// open bare A (resolves `_main`), open bare B as `beta`, then run a turn on A.
+/// A's forwarder still holds `_main` while the turn runs under `beta`, and a
+/// monitor the model creates in that turn is stamped `beta`
+/// (`runtime/profile.rs` -> `goal_tool.rs`). The turn misrouting is pre-existing;
+/// the DELIVERY DROP is not — it exists only because the frame is filtered.
+///
+/// `background/activity` is the worst case: its sink appends over a detached
+/// connection whose writer is discarded, so replay and live fan-out are its
+/// only delivery paths and the drop is total.
+#[tokio::test]
+async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_two_sessions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_a = SessionKey("web-two-open-a".into());
+    let session_b = SessionKey("web-two-open-b".into());
+    let features = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+
+    let beta_activity = |text: &str| {
+        UiNotification::BackgroundActivity(octos_core::ui_protocol::BackgroundActivityEvent {
+            session_id: session_a.clone(),
+            profile_id: Some("beta".to_owned()),
+            origin_kind: "monitor".to_owned(),
+            origin_id: "monitor-model-made".to_owned(),
+            origin_label: Some("ci-tail".to_owned()),
+            text: text.to_owned(),
+            emitted_at_ms: 1_760_000_000_000,
+            dropped_count: None,
+            suppressed: false,
+        })
+    };
+
+    // No routing header anywhere: this connection is plain unscoped.
+    let open = |session_id: SessionKey, profile_id: Option<&str>, rpc_id: &str| {
+        let params = SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: profile_id.map(ToOwned::to_owned),
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        };
+        (params, rpc_id.to_owned())
+    };
+
+    let (params_a, id_a) = open(session_a.clone(), None, "open-a");
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            None,
+            features,
+            id_a,
+            params_a,
+            false,
+        )
+        .await,
+        "bare session A must open on an unscoped connection"
+    );
+    drain_session_open_frames(&mut rx).await;
+
+    let (params_b, id_b) = open(session_b.clone(), Some("beta"), "open-b");
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            None,
+            features,
+            id_b,
+            params_b,
+            false,
+        )
+        .await,
+        "bare session B must open under beta on the same connection"
+    );
+    drain_session_open_frames(&mut rx).await;
+
+    // A turn on session A now runs under beta's runtime, so the monitor it
+    // creates emits beta-stamped activity onto session A's stream.
+    ledger.append_notification(beta_activity("live log line"));
+
+    let live = next_frame_within(&mut rx, 2_000).await.expect(
+        "session A must still receive the activity its own turn produced, even though the turn \
+         ran under the profile a later open bound",
+    );
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+    );
+    assert_eq!(live["params"]["text"], json!("live log line"));
+
+    // Same property on reconnect replay — the only other delivery path this
+    // notification has.
+    let (params_reconnect, id_reconnect) = open(session_a.clone(), None, "reopen-a");
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            None,
+            features,
+            id_reconnect,
+            params_reconnect,
+            false,
+        )
+        .await,
+        "session A must reopen"
+    );
+    // Drain everything the reopen queued rather than stopping at the first
+    // `session/open` notification — on a reconnect the REPLAYED historical open
+    // frame precedes the activity we are looking for.
+    let mut replayed: Vec<String> = Vec::new();
+    while let Some(frame) = next_frame_within(&mut rx, 500).await {
+        if frame.get("method").and_then(Value::as_str)
+            == Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY)
+        {
+            replayed.push(
+                frame["params"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(
+        replayed,
+        vec!["live log line".to_owned()],
+        "reconnect replay must not drop session A's own activity"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
 }
 
 #[test]
@@ -13100,6 +14582,7 @@ async fn session_open_replays_notifications_after_cursor_and_returns_ledger_curs
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -13163,6 +14646,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: base_session.clone(),
@@ -13193,6 +14677,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -13233,6 +14718,7 @@ async fn session_open_rejects_after_cursor_from_other_stream() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -13295,6 +14781,7 @@ async fn session_open_rejects_stale_after_cursor() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -13351,6 +14838,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -13434,6 +14922,7 @@ async fn session_open_replays_pending_question_for_negotiated_client() {
         &approvals,
         &questions,
         ConnectionId::next(),
+        None,
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
@@ -13769,6 +15258,7 @@ async fn session_open_does_not_duplicate_pending_question_already_in_cursor_repl
         &questions,
         ConnectionId::next(),
         None,
+        None,
         features_with_user_question_v1(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -14007,6 +15497,7 @@ async fn session_open_does_not_duplicate_pending_approval_already_in_cursor_repl
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -14054,6 +15545,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures {
             typed_approvals: false,
             pane_snapshots: true,
@@ -14083,6 +15575,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14137,6 +15630,7 @@ async fn session_open_rejects_cwd_without_negotiated_feature() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id,
@@ -14175,6 +15669,7 @@ async fn session_open_result_advertises_full_protocol_when_no_header() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -14248,6 +15743,7 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         features,
         SessionOpenParams {
@@ -17601,6 +19097,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -17626,6 +19123,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -19746,6 +21244,7 @@ async fn reconnect_after_decision_replays_decided_event() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -20252,12 +21751,10 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     assert_eq!(
@@ -20326,7 +21823,6 @@ async fn unified_terminal_sink_failure_without_ack_suppresses_recovery() {
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     assert_eq!(
@@ -20368,12 +21864,10 @@ async fn unified_terminal_sink_success_queues_child_completed_under_profile() {
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
     crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
@@ -22552,6 +24046,7 @@ async fn live_forwarder_topic_scope_drops_other_topic_events() {
         ws_alpha.connection_id(),
         ConnectionUiFeatures::default(),
         Some("alpha".into()),
+        Some(MAIN_PROFILE_ID.to_owned()),
         alpha_live_rx,
         forwarders_alpha.clone(),
     )
@@ -22566,6 +24061,7 @@ async fn live_forwarder_topic_scope_drops_other_topic_events() {
         ws_beta.connection_id(),
         ConnectionUiFeatures::default(),
         Some("beta".into()),
+        Some(MAIN_PROFILE_ID.to_owned()),
         beta_live_rx,
         forwarders_beta.clone(),
     )
@@ -22672,6 +24168,7 @@ async fn live_forwarder_delivers_file_attached_to_topic_scoped_subscriber() {
         ws.connection_id(),
         features_for_file_attached_test(true),
         Some("slides".into()),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -22724,6 +24221,7 @@ async fn live_forwarder_delivers_tool_and_approval_events_to_topic_scoped_subscr
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         Some("slides".into()),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -22849,6 +24347,7 @@ async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         Some("slides".into()),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -22942,6 +24441,7 @@ async fn live_forwarder_pushes_v2_assistant_persisted_to_subscribed_ws() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -22986,6 +24486,7 @@ async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23031,6 +24532,7 @@ async fn live_forwarder_delivers_v2_without_a_capability_flag() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23380,6 +24882,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
         ws.connection_id(),
         features_for_projection_envelope_v2_test(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
     )
@@ -23557,6 +25060,7 @@ async fn v2_background_child_never_appends_to_parent_after_terminal() {
         ws.connection_id(),
         features_for_projection_envelope_v2_test(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
     )
@@ -23648,6 +25152,7 @@ async fn unnegotiated_connection_receives_only_canonical_v2_wire_shape() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -24161,6 +25666,7 @@ async fn live_forwarder_routes_background_child_as_canonical_v2() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -24948,6 +26454,7 @@ async fn live_forwarder_delivers_background_child_without_legacy_fallback() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -24992,6 +26499,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         ws_a.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         rx_a_live,
         forwarders_a.clone(),
     )
@@ -25005,6 +26513,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         ws_b.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         rx_b_live,
         forwarders_b.clone(),
     )
@@ -25116,6 +26625,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -25162,6 +26672,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -25199,6 +26710,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         ws_other.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx_other,
         forwarders_other.clone(),
     )
@@ -25359,6 +26871,7 @@ async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -26411,6 +27924,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-custom-cwd"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -26643,6 +28157,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11-session-sandbox"),
+        None,
         features,
         SessionOpenParams {
             session_id: gamma.clone(),
@@ -26666,6 +28181,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11-session-sandbox"),
+        None,
         features,
         SessionOpenParams {
             session_id: delta.clone(),
@@ -26735,6 +28251,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-multi-cwd"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_a.clone(),
@@ -26756,6 +28273,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-multi-cwd"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_b.clone(),
@@ -26906,6 +28424,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-rebind-attempt"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -26926,6 +28445,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-rebind-attempt"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -27002,6 +28522,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
         // No connection identity so the routed id falls to the
         // session-id-embedded "m11e-not-registered".
         None,
+        None,
         features,
         SessionOpenParams {
             session_id,
@@ -27071,6 +28592,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-symlink"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_a.clone(),
@@ -27196,6 +28718,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11f-tier2-default"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -27289,6 +28812,7 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some(profile_id),
+        None,
         ConnectionUiFeatures {
             session_workspace_cwd: false,
             header_present: true,
@@ -27351,6 +28875,7 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some(profile_id),
+        None,
         ConnectionUiFeatures {
             session_workspace_cwd: true,
             header_present: true,
@@ -29570,6 +31095,7 @@ fn peer_close_resolves_open_goal_escalations_in_ledger() {
             status: "active".to_owned(),
             tokens_used: 0,
             token_budget: 1_000,
+            time_used_seconds: 0,
             continuations_used: 0,
             revision: 0,
             created_at_ms: 1_000,
@@ -33510,4 +35036,386 @@ async fn interactive_sentinel_skips_verifier_without_completion_claim() {
         .goal_counters_for_test(&wire)
         .expect("goal exists");
     assert_eq!(tokens_used, 0, "nothing charged without a claim");
+}
+
+// ---- task-return-unconsumed-steer-inputs: accepted-but-undrained steers are
+// returned to the client as `turn/steer_dropped` at turn end ----
+
+fn steer_dropped_frame(writer_rx: &std::sync::mpsc::Receiver<WsMessage>) -> Value {
+    let message = writer_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("a frame reaches the stdio writer");
+    let WsMessage::Text(text) = message else {
+        panic!("expected a text frame");
+    };
+    serde_json::from_str::<Value>(text.as_ref()).expect("valid JSON frame")
+}
+
+fn ledgered_steer_dropped(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+) -> Vec<octos_core::ui_protocol::TurnSteerDroppedEvent> {
+    let baseline = UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    };
+    ledger
+        .replay_after(session_id, Some(&baseline))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| match &e.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSteerDropped(event)) => {
+                Some(event.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dropped".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("first steer".into());
+    buffer.push("second steer".into());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
+
+    assert_eq!(returned, 2);
+    assert!(buffer.is_empty(), "the buffer is drained");
+    let frame = steer_dropped_frame(&writer_rx);
+    assert_eq!(frame["method"], json!("turn/steer_dropped"));
+    assert_eq!(frame["params"]["session_id"], json!("local:steer-dropped"));
+    assert_eq!(frame["params"]["turn_id"], json!(turn_id));
+    assert_eq!(
+        frame["params"]["inputs"],
+        json!(["first steer", "second steer"]),
+        "buffer order is preserved"
+    );
+    assert_eq!(frame["params"]["reason"], json!("interrupted"));
+
+    let ledgered = ledgered_steer_dropped(&ledger, &session_id);
+    assert_eq!(
+        ledgered.len(),
+        1,
+        "the return is durable for reconnect replay"
+    );
+    assert_eq!(ledgered[0].inputs, vec!["first steer", "second steer"]);
+    assert_eq!(ledgered[0].reason, "interrupted");
+}
+
+#[test]
+fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dropped-ended".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("late steer".into());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        false,
+    );
+
+    assert_eq!(returned, 1);
+    let frame = steer_dropped_frame(&writer_rx);
+    assert_eq!(frame["params"]["reason"], json!("turn_ended"));
+    assert_eq!(frame["params"]["inputs"], json!(["late steer"]));
+}
+
+#[test]
+fn no_leftover_steers_emits_nothing() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-none".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
+
+    assert_eq!(returned, 0);
+    assert!(
+        writer_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "an empty buffer must not produce an empty return frame"
+    );
+    assert!(ledgered_steer_dropped(&ledger, &session_id).is_empty());
+    // Terminal payload shapes are untouched by this task: the legacy
+    // `turn/error` frame still carries exactly its four fields.
+    let error = UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_id.clone(),
+        code: "interrupted".into(),
+        message: "turn interrupted by client".into(),
+    })
+    .into_rpc_notification()
+    .expect("serialize turn/error");
+    let keys: Vec<&str> = error
+        .params
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["session_id", "turn_id", "code", "message"]);
+}
+
+#[test]
+fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    let ws = WsConnection::new_stdio(writer_tx);
+    // Simulate a dead stdio peer: the receiver is gone, so every send fails.
+    drop(writer_rx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dead-peer".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("orphaned steer".into());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
+
+    assert_eq!(returned, 1);
+    let ledgered = ledgered_steer_dropped(&ledger, &session_id);
+    assert_eq!(ledgered.len(), 1, "text survives in the ledger for replay");
+    assert_eq!(ledgered[0].inputs, vec!["orphaned steer"]);
+}
+
+/// task-return-unconsumed-steer-inputs (v2 ordering): once the turn flips to
+/// Terminal, its accepted-but-undrained steers are returned as ONE
+/// `turn/steer_dropped` BEFORE the terminal frame, on the same connection —
+/// so a client may treat "terminal without a preceding steer_dropped naming
+/// my steer" as "consumed". Drives `try_emit_terminal` directly (the wire-side
+/// closure), like the #1332 test above.
+#[tokio::test]
+async fn steer_dropped_is_emitted_before_the_terminal_frame() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+    let ws = WsConnection::new(tx);
+    let ledger = UiProtocolLedger::new(32);
+    let session_id = SessionKey("local:steer-order".into());
+    let turn_id = TurnId::new();
+    let turn_state = TokioMutex::new(TurnState::Active);
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("accepted but never drained".into());
+
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Interrupted,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        Some(("interrupted", "turn interrupted by client")),
+        None,
+        Some(&buffer),
+    )
+    .await;
+
+    let mut methods = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let axum::extract::ws::Message::Text(text) = msg {
+            let frame: Value = serde_json::from_str(text.as_ref()).expect("json frame");
+            if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                methods.push(method.to_string());
+                if method == "turn/steer_dropped" {
+                    assert_eq!(
+                        frame["params"]["inputs"],
+                        json!(["accepted but never drained"])
+                    );
+                    assert_eq!(frame["params"]["reason"], json!("interrupted"));
+                }
+            }
+        }
+    }
+    let dropped_at = methods.iter().position(|m| m == "turn/steer_dropped");
+    let terminal_at = methods.iter().position(|m| m == "turn/error");
+    assert!(dropped_at.is_some(), "steer_dropped emitted: {methods:?}");
+    assert!(terminal_at.is_some(), "terminal emitted: {methods:?}");
+    assert!(
+        dropped_at < terminal_at,
+        "steer_dropped must precede the terminal: {methods:?}"
+    );
+    assert!(buffer.is_empty());
+    assert!(matches!(
+        *turn_state.lock().await,
+        TurnState::Terminal(TerminalReason::Interrupted)
+    ));
+
+    // A second terminal attempt is a no-op (idempotent) and returns nothing more.
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Interrupted,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        Some(("interrupted", "turn interrupted by client")),
+        None,
+        Some(&buffer),
+    )
+    .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no duplicate frames after the terminal"
+    );
+}
+
+/// Once the state is Terminal, `turn/steer` can no longer be accepted for the
+/// turn — the settlement above therefore saw the complete set of inputs.
+#[tokio::test]
+async fn steer_is_not_accepted_after_terminal_transition() {
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed).await;
+    assert!(transition.is_some());
+    // The steer admission check reads the same state: Terminal → NoActiveTurn.
+    let terminal = matches!(*turn_state.lock().await, TurnState::Terminal(_));
+    assert!(terminal, "post-terminal steers fall back to a fresh turn");
+}
+
+/// The dropped-before-terminal guarantee is advertised as
+/// `event.turn_steer_dropped.v1` — on by default for stdio, and honoured when
+/// a ws client requests it — so a client can decide whether "terminal without
+/// steer_dropped" means "consumed" (new server) or "unknown" (old server).
+#[test]
+fn turn_steer_dropped_feature_is_advertised_when_requested_and_by_stdio_default() {
+    let stdio = ConnectionUiFeatures::stdio_defaults().negotiated_capabilities();
+    assert!(
+        stdio
+            .supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+        "{:?}",
+        stdio.supported_features
+    );
+    let ws = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1],
+        false,
+    )
+    .negotiated_capabilities();
+    assert!(
+        ws.supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1)
+    );
+    let legacy = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1],
+        false,
+    )
+    .negotiated_capabilities();
+    assert!(
+        !legacy
+            .supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+        "not advertised unless requested"
+    );
+}
+
+/// task-return-unconsumed-steer-inputs (review round 3, P0): the connection-
+/// close abort path is a terminal outlet too. It must go through the same
+/// gate, so the ledger a reconnecting client replays reads
+/// `turn/steer_dropped` strictly BEFORE `turn/error(connection_closed)`.
+#[tokio::test]
+async fn connection_close_settles_steers_before_connection_closed_terminal() {
+    let session_id = SessionKey("api:profile/local:closing".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("typed just before the socket died".into());
+    let mut entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    entry.steer = Some(buffer.clone());
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    connection_turns
+        .lock()
+        .await
+        .insert(session_id.clone(), turn_id.clone());
+
+    let scopes = ScopePolicy::default();
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let user_questions = PendingQuestionStore::default();
+    abort_connection_turns(
+        &active_turns,
+        &connection_turns,
+        &scopes,
+        &ledger,
+        &approvals,
+        &user_questions,
+    )
+    .await;
+
+    let baseline = UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    };
+    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+    let kinds: Vec<String> = replay
+        .iter()
+        .filter_map(|e| match &e.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSteerDropped(d)) => {
+                assert_eq!(d.inputs, vec!["typed just before the socket died"]);
+                assert_eq!(d.reason, "interrupted");
+                Some("turn/steer_dropped".to_string())
+            }
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnError(err)) => {
+                Some(format!("turn/error:{}", err.code))
+            }
+            _ => None,
+        })
+        .collect();
+    let dropped_at = kinds.iter().position(|k| k == "turn/steer_dropped");
+    let terminal_at = kinds
+        .iter()
+        .position(|k| k == "turn/error:connection_closed");
+    assert!(dropped_at.is_some() && terminal_at.is_some(), "{kinds:?}");
+    assert!(
+        dropped_at < terminal_at,
+        "replay order must be steer_dropped → terminal: {kinds:?}"
+    );
+    assert!(
+        buffer.is_empty(),
+        "the aborted turn's later safety-net drain finds nothing"
+    );
+    handle.abort();
 }

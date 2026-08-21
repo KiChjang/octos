@@ -283,6 +283,14 @@ jobs:
       - name: Test octos-pipeline
         run: cargo test -p octos-pipeline
 
+      # #2055 — octos-fleet was missing from this list entirely (the #2029
+      # failure mode at crate granularity: absent coverage prints nothing and
+      # looks like passing coverage), so the goal-ledger suite — including the
+      # #2054/#2057 task-status writer and the #2055 idempotent task-row
+      # upsert — never ran in CI.
+      - name: Test octos-fleet
+        run: cargo test -p octos-fleet
+
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 
@@ -442,6 +450,15 @@ jobs:
       # worktree, which a repo-global `git worktree prune` used to do).
       - name: Peer staging + worktree fencing (octos-cli)
         run: cargo test -p octos-cli --features api peer
+
+      # `commands::serve::tests` matched NONE of the filters on this list, so
+      # its guards had not executed in CI since #1728 — long enough for
+      # `global_drain_spawns_before_the_stdio_early_return` to go red on main
+      # unnoticed (its source-scan needle carried the pre-rename module path).
+      # A filter that matches nothing reports `ok`, so absent coverage is
+      # indistinguishable from passing coverage; see #2029 for the general fix.
+      - name: serve wiring guards (octos-cli)
+        run: cargo test -p octos-cli --features api commands::serve::tests
 
       # The goal-completion verifier's ledger-evidence fold lives in the
       # `api`-gated goal_tool module, so the unfeatured runs above never compile
@@ -1032,17 +1049,63 @@ jobs:
       - name: Install Homebrew ffmpeg (macOS)
         run: brew install ffmpeg
 
+      # #2031 — the four ffmpeg/PATH specs in `tool-use-regression.spec.ts`
+      # drive `POST /api/admin/shell`, and that route is registered ONLY when
+      # `allow_admin_shell` is true (api/router.rs). It defaults to false and
+      # nothing in CI ever set it, so every one of those requests answered
+      # 404 `{"error":"not_found"}`. `res.json()` on that body has no
+      # `exit_code` field, which is why the failures read
+      # `expect(result.exit_code).toBe(0) // Received: undefined` — an absent
+      # route, not a missing binary and not a PATH problem.
+      #
+      # This is a full-RCE endpoint, so it is enabled here and nowhere else:
+      # an ephemeral runner, bound to loopback, behind an admin token. Do not
+      # copy this config to anything long-lived.
+      - name: Write CI serve config (enables the admin shell endpoint)
+        run: |
+          echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
+
       - name: Start octos serve
         run: |
-          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 &
-          # Wait for server to be ready
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+            --config /tmp/octos-ci-serve.json &
+          # Wait for server to be ready.
+          #
+          # `/api/status` is a 404 — this probe has never once succeeded, so the
+          # loop always burned its full 30 iterations and the job continued
+          # regardless of whether the server was up. `/health` is the endpoint
+          # that answers 200. Not being ready is now a hard failure instead of a
+          # silent 30-second sleep followed by racy assertions.
+          ready=""
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/api/status -H "Authorization: Bearer ci-test-token" > /dev/null 2>&1; then
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
               echo "Server ready after ${i}s"
+              ready=1
               break
             fi
             sleep 1
           done
+          if [ -z "$ready" ]; then
+            echo "::error::octos serve never answered /health on port 3000 after 30s."
+            exit 1
+          fi
+
+      # Fail loudly at the precondition rather than inside four assertions that
+      # each report it as `undefined`. If this step ever 404s again, the config
+      # above stopped taking effect — that is a different bug from ffmpeg being
+      # absent, and the two were conflated for long enough to be worth naming.
+      - name: Verify the admin shell endpoint is live
+        run: |
+          body=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/api/admin/shell \
+            -H "Authorization: Bearer ci-test-token" \
+            -H 'Content-Type: application/json' \
+            -d '{"command":"command -v ffmpeg"}')
+          code=$(echo "$body" | tail -1)
+          echo "$body" | sed '$d'
+          if [ "$code" != "200" ]; then
+            echo "::error::/api/admin/shell answered HTTP $code — expected 200."
+            exit 1
+          fi
 
       - name: Install e2e deps
         working-directory: e2e
@@ -1061,7 +1124,119 @@ jobs:
         working-directory: e2e
         run: npx playwright install chromium
 
+      # #1923 — run THIS job's namesake, not all 52 specs.
+      #
+      # `npx playwright test` with no filter swept in the whole e2e tree,
+      # including specs that ask a live model for specific words
+      # (`toContain('OK')`, `toContain('ALPHA')`, "answer in Chinese"). Those
+      # fail when a model phrases an answer differently or when CI has no
+      # provider credential — failures nobody can act on. A required check that
+      # fails for unactionable reasons gets routed around, which is exactly what
+      # happened: this job was narrowed to a path filter, went red on main, and
+      # reported SUCCESS by simply not running.
+      #
+      # Required checks stay deterministic. The model-dependent specs run in
+      # `e2e-live-nightly` below, where a flake costs a notification instead of
+      # a merge.
       - name: Run e2e tool regression tests
+        working-directory: e2e
+        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/tool-use-regression.spec.ts
+
+      # #2073 — the model-INDEPENDENT half of the m9 protocol suite, gating.
+      #
+      # These specs assert typed JSON-RPC envelopes and cursor semantics
+      # against a serve with no provider configured at all: unknown/malformed
+      # ids rejected as INVALID_PARAMS, baseline and strictly-later cursors,
+      # cursor_expired, cursor_stream_mismatch. No model is asked for anything,
+      # so nothing here can flake on phrasing — they belong on the required
+      # path, not in the nightly.
+      #
+      # Only these two files are listed because only these two are green
+      # without a configured profile. The rest of the m9 tree (turn/start,
+      # tool events, interrupt, most of fault-injection) needs a `_main`
+      # profile with a provider and answers `-32602 profile '_main' is not
+      # configured` without one; those stay in `e2e-live-nightly` until CI
+      # grows a profile fixture.
+      - name: Run m9 protocol conformance (model-independent)
+        working-directory: e2e
+        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts
+
+      - name: Stop octos serve
+        if: always()
+        run: pkill -f "octos serve" || true
+
+  # #1923 — the model-dependent half of the e2e tree, nightly and NON-BLOCKING.
+  #
+  # These specs ask a live model to produce particular words and then assert on
+  # them exactly (`toContain('OK')`, `toContain('ALPHA')`, CJK output, event
+  # counts). They catch real regressions, but they can also fail because a model
+  # phrased an answer differently or because no provider credential is present —
+  # neither of which is a reason to block a merge.
+  #
+  # `continue-on-error` keeps a red run visible without gating anything. If these
+  # are ever promoted back to required, the assertions need to be semantic rather
+  # than exact-match first.
+  e2e-live-nightly:
+    runs-on: macos-14
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Build dashboard bundle (embedded at compile time)
+        run: ./scripts/build-dashboard.sh
+
+      - name: Build octos with all features
+        run: cargo build --release -p octos-cli --features "$FEATURES"
+
+      - name: Install Homebrew ffmpeg (macOS)
+        run: brew install ffmpeg
+
+      # Same `allow_admin_shell` config as the required job (#2031) — this job
+      # runs the full tree, which includes the admin-shell specs.
+      - name: Write CI serve config (enables the admin shell endpoint)
+        run: |
+          echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
+
+      - name: Start octos serve
+        run: |
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+            --config /tmp/octos-ci-serve.json &
+          # `/api/status` is a 404; `/health` is the endpoint that answers 200.
+          # See the identical note in `e2e-tool-regression` above.
+          ready=""
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::octos serve never answered /health on port 3000 after 30s."
+            exit 1
+          fi
+
+      - name: Install e2e deps
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install chromium
+
+      - name: Run model-dependent e2e specs
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line
 
