@@ -1446,6 +1446,10 @@ pub async fn session_workspace_contract(
     Json(statuses).into_response()
 }
 
+// The error is a ready-to-return HTTP response. Keeping it intact lets every
+// caller preserve the original status, headers, and body without rebuilding
+// the response or allocating a box on this cold error path.
+#[allow(clippy::result_large_err)]
 async fn resolve_file_access_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -2360,6 +2364,10 @@ pub(crate) fn decide_resolved_profile_id(
     }
 }
 
+// The error is a ready-to-return HTTP response. Keeping it intact lets every
+// caller preserve the original status, headers, and body without rebuilding
+// the response or allocating a box on this cold error path.
+#[allow(clippy::result_large_err)]
 async fn resolve_profile_data_dir(
     state: &AppState,
     headers: &HeaderMap,

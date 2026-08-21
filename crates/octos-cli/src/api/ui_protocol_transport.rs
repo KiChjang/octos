@@ -11806,8 +11806,7 @@ fn raw_profile_llm_delete(
         ));
     };
 
-    let applied: bool;
-    if llm
+    let applied = if llm
         .primary
         .as_ref()
         .is_some_and(|primary| same_llm_selection_address(primary, &target))
@@ -11819,13 +11818,13 @@ fn raw_profile_llm_delete(
         if !llm.fallbacks.is_empty() {
             llm.primary = Some(llm.fallbacks.remove(0));
         }
-        applied = true;
+        true
     } else {
         let before = llm.fallbacks.len();
         llm.fallbacks
             .retain(|fallback| !same_llm_selection_address(fallback, &target));
-        applied = llm.fallbacks.len() != before;
-    }
+        llm.fallbacks.len() != before
+    };
     profile.config.llm = Some(llm);
 
     if !applied {
