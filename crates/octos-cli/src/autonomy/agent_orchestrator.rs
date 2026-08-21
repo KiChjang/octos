@@ -2149,6 +2149,30 @@ impl InProcessAgentOrchestrator {
             .get(&upsert.agent_id)
             .map(|agent| agent.status.clone());
         let (agent, payload, transitioned_terminal) = {
+            // Refs #2102 (Gap 3): live spawn admission. A NEW agent record
+            // entering an ALREADY-JOINED group bumps the join epoch BEFORE
+            // the entry is created, under the same state lock — the crash
+            // window is empty and the bump is single-writer.
+            let existing = state.agents.contains_key(&upsert.agent_id);
+            if !existing {
+                let group = format!(
+                    "agent-group:{}:{}:{}",
+                    upsert.profile_id,
+                    upsert.session_id,
+                    upsert.parent_agent_id.as_deref().unwrap_or("master")
+                );
+                let already_joined = state
+                    .scatter_join_state
+                    .get(&group)
+                    .is_some_and(|s| s.last_joined_key.is_some());
+                if already_joined {
+                    state
+                        .scatter_join_state
+                        .entry(group)
+                        .or_default()
+                        .join_epoch += 1;
+                }
+            }
             let entry = state
                 .agents
                 .entry(upsert.agent_id.clone())
