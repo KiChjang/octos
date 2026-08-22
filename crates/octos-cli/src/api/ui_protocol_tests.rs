@@ -14,37 +14,6 @@ use octos_core::ui_protocol::{
 };
 
 #[test]
-fn should_sanitize_privacy_safe_voice_diagnostics_for_logs() {
-    let params: RawVoiceAdmitParams = serde_json::from_value(json!({
-        "session_id": "profile:api:voice",
-        "request_id": "request-diagnostics",
-        "turn_id": TurnId::new(),
-        "media": [],
-        "diagnostics": {
-            "surface": "learn",
-            "capture_mode": "listening",
-            "source": "vad",
-            "camera_active": true,
-            "sample_rate_hz": 16000,
-            "audio_duration_ms": 999999,
-            "rms": -1,
-            "peak": 4
-        }
-    }))
-    .expect("voice/admit diagnostics should deserialize");
-
-    let diagnostics = params.diagnostics.expect("diagnostics").for_log();
-    assert_eq!(diagnostics.surface, "learn");
-    assert_eq!(diagnostics.capture_mode, "listening");
-    assert_eq!(diagnostics.source, "vad");
-    assert!(diagnostics.camera_active);
-    assert_eq!(diagnostics.sample_rate_hz, Some(16_000));
-    assert_eq!(diagnostics.audio_duration_ms, Some(120_000.0));
-    assert_eq!(diagnostics.rms, Some(0.0));
-    assert_eq!(diagnostics.peak, Some(1.0));
-}
-
-#[test]
 fn should_normalize_safe_tool_context_at_protocol_boundary() {
     assert_eq!(
         normalize_tool_context(Some("  notebook  ")),

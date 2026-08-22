@@ -399,11 +399,7 @@ Session, turn, and approval core:
 - `voice/admit` (advertised by `voice.asr_admission.v1`; ASR-only preflight for uploaded
   audio. Returns `status: speech` with a 120-second, session/turn/audio-scoped
   single-use `admission_id`, or `status: no_speech`. It never starts an LLM
-  turn and sibling text/image inputs cannot override `no_speech`. Clients may
-  include `diagnostics` containing only the surface, capture stage, audio
-  duration, sample rate, RMS, peak level, and whether a camera frame was
-  attached. Servers use these fields only for bounded operational logs; raw
-  audio, transcripts, prompts, images, and filenames are never included.)
+  turn and sibling text/image inputs cannot override `no_speech`.)
 - `voice/commit_admission` (advertised by `voice.asr_admission.v1`; atomically consumes a
   speech admission, optionally interrupts `supersedes_turn_id`, and starts the
   admitted turn without repeating ASR. Same-turn retries are idempotent;
