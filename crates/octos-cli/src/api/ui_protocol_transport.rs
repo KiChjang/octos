@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::Extension;
@@ -7609,6 +7609,93 @@ struct RawVoiceAdmitParams {
     media: Vec<FileRef>,
     #[serde(default)]
     topic: Option<String>,
+    #[serde(default)]
+    diagnostics: Option<RawVoiceAdmissionDiagnostics>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawVoiceAdmissionDiagnostics {
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    capture_mode: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    camera_active: bool,
+    #[serde(default)]
+    sample_rate_hz: Option<u32>,
+    #[serde(default)]
+    audio_duration_ms: Option<f64>,
+    #[serde(default)]
+    rms: Option<f64>,
+    #[serde(default)]
+    peak: Option<f64>,
+}
+
+#[derive(Debug)]
+struct VoiceAdmissionDiagnosticsForLog {
+    surface: &'static str,
+    capture_mode: &'static str,
+    source: &'static str,
+    camera_active: bool,
+    sample_rate_hz: Option<u32>,
+    audio_duration_ms: Option<f64>,
+    rms: Option<f64>,
+    peak: Option<f64>,
+}
+
+impl Default for VoiceAdmissionDiagnosticsForLog {
+    fn default() -> Self {
+        Self {
+            surface: "unknown",
+            capture_mode: "unknown",
+            source: "unknown",
+            camera_active: false,
+            sample_rate_hz: None,
+            audio_duration_ms: None,
+            rms: None,
+            peak: None,
+        }
+    }
+}
+
+impl RawVoiceAdmissionDiagnostics {
+    fn for_log(&self) -> VoiceAdmissionDiagnosticsForLog {
+        VoiceAdmissionDiagnosticsForLog {
+            surface: match self.surface.as_deref() {
+                Some("voice") => "voice",
+                Some("learn") => "learn",
+                _ => "unknown",
+            },
+            capture_mode: match self.capture_mode.as_deref() {
+                Some("initial") => "initial",
+                Some("listening") => "listening",
+                Some("thinking") => "thinking",
+                Some("speaking") => "speaking",
+                _ => "unknown",
+            },
+            source: match self.source.as_deref() {
+                Some("initial") => "initial",
+                Some("vad") => "vad",
+                _ => "unknown",
+            },
+            camera_active: self.camera_active,
+            sample_rate_hz: self.sample_rate_hz.map(|value| value.clamp(8_000, 192_000)),
+            audio_duration_ms: self
+                .audio_duration_ms
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 120_000.0)),
+            rms: self
+                .rms
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 1.0)),
+            peak: self
+                .peak
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 1.0)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -19751,6 +19838,27 @@ async fn handle_voice_admit(
         );
         return;
     }
+    let diagnostics = params
+        .diagnostics
+        .as_ref()
+        .map(RawVoiceAdmissionDiagnostics::for_log)
+        .unwrap_or_default();
+    info!(
+        target: "octos::voice::admission",
+        event = "voice_admission_received",
+        request_id = %params.request_id,
+        turn_id = ?params.turn_id,
+        surface = diagnostics.surface,
+        capture_mode = diagnostics.capture_mode,
+        capture_source = diagnostics.source,
+        camera_active = diagnostics.camera_active,
+        sample_rate_hz = ?diagnostics.sample_rate_hz,
+        audio_duration_ms = ?diagnostics.audio_duration_ms,
+        rms = ?diagnostics.rms,
+        peak = ?diagnostics.peak,
+        audio_file_count = audio_paths.len(),
+        "received privacy-safe voice admission diagnostics"
+    );
     let session_runtime =
         match resolve_voice_admission_runtime(state, &session_id, connection_profile_id).await {
             Ok(runtime) => runtime,
@@ -19790,11 +19898,37 @@ async fn handle_voice_admit(
             return;
         }
     };
+    let asr_started = Instant::now();
+    info!(
+        target: "octos::voice::admission",
+        event = "voice_asr_started",
+        request_id = %params.request_id,
+        turn_id = ?params.turn_id,
+        surface = diagnostics.surface,
+        audio_file_count = asr_media.len(),
+        language_configured = asr_language.is_some(),
+        "starting ASR admission preflight"
+    );
     let outcome =
         crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
+    let asr_elapsed_ms = asr_started.elapsed().as_millis() as u64;
     match outcome.status() {
         VoiceAsrStatus::Speech => {
             let transcript = outcome.accepted_transcripts.join("\n");
+            info!(
+                target: "octos::voice::admission",
+                event = "voice_asr_completed",
+                request_id = %params.request_id,
+                turn_id = ?params.turn_id,
+                surface = diagnostics.surface,
+                status = "speech",
+                asr_elapsed_ms,
+                transcript_chars = transcript.chars().count(),
+                accepted_count = outcome.accepted_transcripts.len(),
+                rejected_count = outcome.reject_reasons.len(),
+                failed_count = outcome.failed_count,
+                "ASR admission completed without logging transcript content"
+            );
             let issued = contracts.voice_admissions.issue(
                 params.request_id,
                 session_id,
@@ -19814,6 +19948,20 @@ async fn handle_voice_admit(
             );
         }
         VoiceAsrStatus::NoSpeech => {
+            info!(
+                target: "octos::voice::admission",
+                event = "voice_asr_completed",
+                request_id = %params.request_id,
+                turn_id = ?params.turn_id,
+                surface = diagnostics.surface,
+                status = "no_speech",
+                asr_elapsed_ms,
+                accepted_count = outcome.accepted_transcripts.len(),
+                rejected_count = outcome.reject_reasons.len(),
+                failed_count = outcome.failed_count,
+                reject_reasons = ?outcome.reject_reasons,
+                "ASR admission rejected the capture without creating a turn"
+            );
             let _ = send_rpc_result(
                 ws,
                 id,
@@ -19825,6 +19973,19 @@ async fn handle_voice_admit(
             );
         }
         VoiceAsrStatus::Failed | VoiceAsrStatus::NoAudio => {
+            warn!(
+                target: "octos::voice::admission",
+                event = "voice_asr_completed",
+                request_id = %params.request_id,
+                turn_id = ?params.turn_id,
+                surface = diagnostics.surface,
+                status = "failed",
+                asr_elapsed_ms,
+                accepted_count = outcome.accepted_transcripts.len(),
+                rejected_count = outcome.reject_reasons.len(),
+                failed_count = outcome.failed_count,
+                "ASR admission preflight failed"
+            );
             let error = RpcError::internal_error("voice ASR preflight failed").with_data(json!({
                 "kind": "voice_asr_unavailable",
                 "failed_count": outcome.failed_count,
@@ -19908,6 +20069,13 @@ async fn handle_voice_commit_admission(
     };
     let session_id =
         voice_session_with_topic(&params.turn.session_id, params.turn.topic.as_deref());
+    info!(
+        target: "octos::voice::admission",
+        event = "voice_admission_commit_received",
+        turn_id = ?params.turn.turn_id,
+        supersedes_existing_turn = params.supersedes_turn_id.is_some(),
+        "received admitted voice turn commit"
+    );
     if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
         return;
@@ -19926,6 +20094,14 @@ async fn handle_voice_commit_admission(
         }
     };
     if claim == VoiceAdmissionClaim::AlreadyCommitted {
+        info!(
+            target: "octos::voice::admission",
+            event = "voice_admission_commit_completed",
+            turn_id = ?params.turn.turn_id,
+            started = true,
+            idempotent = true,
+            "voice turn was already committed"
+        );
         let _ = send_rpc_result(
             ws,
             id,
@@ -19975,6 +20151,14 @@ async fn handle_voice_commit_admission(
     } else {
         contracts.voice_admissions.release(&admission_id, &turn_id);
     }
+    info!(
+        target: "octos::voice::admission",
+        event = "voice_admission_commit_completed",
+        turn_id = ?turn_id,
+        started,
+        idempotent = false,
+        "finished admitted voice turn commit"
+    );
 }
 
 /// `handle_turn_start` body with a caller-chosen accept payload.
