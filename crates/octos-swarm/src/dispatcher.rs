@@ -975,9 +975,9 @@ async fn dispatch_with_budget(
     budget: Option<&SwarmCostBudget>,
     policy: &DispatchPolicy,
 ) -> SubtaskOutcome {
-    if let Some(outcome) = enforce_or_outcome(policy, backend, contract, prior_attempts).await {
+    if let Err(outcome) = enforce_or_outcome(policy, backend, contract, prior_attempts).await {
         record_dispatch_gate_metric(backend.backend_label(), &outcome.last_dispatch_outcome);
-        return outcome;
+        return *outcome;
     }
 
     let Some(budget) = budget else {

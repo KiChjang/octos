@@ -19,7 +19,7 @@ use crate::result::{SubtaskOutcome, SubtaskStatus};
 use crate::topology::ContractSpec;
 
 /// Helper for the dispatcher: enforce gates and synthesise a
-/// [`SubtaskOutcome`] on denial. Returns `None` if dispatch may
+/// [`SubtaskOutcome`] on denial. Returns `Ok(())` if dispatch may
 /// proceed, otherwise the failure outcome to use in place of a backend
 /// dispatch.
 pub(crate) async fn enforce_or_outcome(
@@ -27,15 +27,15 @@ pub(crate) async fn enforce_or_outcome(
     backend: &dyn McpAgentBackend,
     contract: &ContractSpec,
     prior_attempts: u32,
-) -> Option<SubtaskOutcome> {
+) -> std::result::Result<(), Box<SubtaskOutcome>> {
     let target = DispatchTarget {
         dispatch_id: &contract.contract_id,
         tool_name: &contract.tool_name,
         task: &contract.task,
     };
     match enforce_dispatch_gates(policy, backend, target).await {
-        Ok(()) => None,
-        Err(denial) => Some(SubtaskOutcome {
+        Ok(()) => Ok(()),
+        Err(denial) => Err(Box::new(SubtaskOutcome {
             contract_id: contract.contract_id.clone(),
             label: contract.label.clone(),
             status: SubtaskStatus::TerminalFailed,
@@ -44,7 +44,7 @@ pub(crate) async fn enforce_or_outcome(
             output: denial.reason.clone(),
             files_to_send: Vec::new(),
             error: Some(denial.reason),
-        }),
+        })),
     }
 }
 
@@ -93,7 +93,7 @@ mod tests {
         assert!(
             enforce_or_outcome(&policy, &backend, &contract, 0)
                 .await
-                .is_none()
+                .is_ok()
         );
     }
 
@@ -110,7 +110,7 @@ mod tests {
         let contract = contract("c1", "forbidden");
         let outcome = enforce_or_outcome(&policy, &backend, &contract, 0)
             .await
-            .expect("denied");
+            .expect_err("denied");
         assert_eq!(outcome.status, SubtaskStatus::TerminalFailed);
         assert_eq!(outcome.last_dispatch_outcome, "policy_denied");
         assert_eq!(outcome.attempts, 1);

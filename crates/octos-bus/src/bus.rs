@@ -127,6 +127,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_outbound_send_preserves_the_unsent_message() {
+        let (agent, publisher) = create_bus();
+        drop(publisher);
+
+        let error = agent
+            .send_outbound(make_outbound("not-delivered"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0.content, "not-delivered");
+    }
+
+    #[tokio::test]
     async fn test_dropped_sender_closes_receiver() {
         let (mut agent, publisher) = create_bus();
         drop(publisher);
