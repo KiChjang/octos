@@ -29621,6 +29621,68 @@ fn oversized_frame_with_multibyte_and_control_bytes_is_boundary_safe_and_under_c
     assert!(text.starts_with('情'));
 }
 
+/// 2c performance regression (黑板第 2 条): a multi-MB hydrate-shaped
+/// payload (1000 large messages, the shape that took ~10s through the old
+/// O(payload × rounds) loop) must be previewed in well under a second and
+/// come out ≤ cap with the truncation marker present.
+#[test]
+fn preview_oversized_frame_multi_mb_hydrate_shape_is_single_pass_fast() {
+    // Hydrate reply shape: an array of message objects with large text.
+    let messages: Vec<Value> = (0..1000)
+        .map(|i| {
+            json!({
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "text": format!("msg-{i}-{}", "m".repeat(5 * 1024)),
+            })
+        })
+        .collect();
+    let value = json!({
+        "jsonrpc": "2.0",
+        "id": "hydrate-1",
+        "result": {
+            "session_id": "local:perf",
+            "messages": messages,
+        }
+    });
+    let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+    assert!(
+        frame.len() > 4 * 1024 * 1024,
+        "fixture must be multi-MB, got {}",
+        frame.len()
+    );
+
+    let start = std::time::Instant::now();
+    let out = preview_oversized_frame(frame);
+    let elapsed = start.elapsed();
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "output must fit the cap, got {}",
+        out.len()
+    );
+    let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+    // The marker must survive somewhere in the shrunk message list —
+    // depending on how much had to be cut, the structural fallback may have
+    // dropped leading elements, so scan all surviving messages.
+    let any_marker = parsed["result"]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .any(|m| {
+            m["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("bytes truncated"))
+        });
+    assert!(any_marker, "truncation marker must be present");
+    // Generous CI bound: the old loop needed ~10s on this shape; single
+    // pass is O(payload). 2s even on slow debug CI is >10x margin over the
+    // 200ms release requirement in the contract.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "single-pass preview took {elapsed:?} — regression toward the O(n²) loop"
+    );
+}
+
 #[test]
 fn oversized_frame_with_multiple_large_fields_iterates_until_under_cap() {
     // Two fields each ~0.7 MiB: neither alone exceeds the cap, but the
