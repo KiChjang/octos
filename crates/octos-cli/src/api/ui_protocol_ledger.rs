@@ -50,8 +50,8 @@
 //! decision record and tradeoffs.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -90,6 +90,12 @@ pub(crate) struct LedgerConfig {
     pub sweep_interval: Duration,
     pub rotate_bytes: u64,
     pub retained_log_files: usize,
+    /// Per-session projection snapshot cadence (step 1b): every
+    /// `snapshot_every_events` appended events the session's retained ring
+    /// is written to `snapshot.json` next to the log files. Recovery then
+    /// loads the latest snapshot and replays only the tail (events with
+    /// seq > snapshot head). `0` disables snapshotting.
+    pub snapshot_every_events: u64,
     /// When `None`, the ledger is RAM-only (Path B fallback / unit tests).
     pub data_dir: Option<PathBuf>,
 }
@@ -103,6 +109,7 @@ impl LedgerConfig {
             sweep_interval: Duration::from_secs(60),
             rotate_bytes: 10 * 1024 * 1024,
             retained_log_files: 5,
+            snapshot_every_events: 4096,
             data_dir: None,
         }
     }
@@ -115,6 +122,7 @@ impl LedgerConfig {
             sweep_interval: Duration::from_secs(60),
             rotate_bytes: 10 * 1024 * 1024,
             retained_log_files: 5,
+            snapshot_every_events: 4096,
             data_dir: Some(data_dir),
         }
     }
@@ -250,6 +258,27 @@ struct LedgerDiskRecord {
 }
 
 const LEDGER_DISK_VERSION: u32 = 1;
+
+// ---------- Per-session projection snapshot (step 1b) ----------
+
+/// On-disk projection snapshot for one session. Written every
+/// `LedgerConfig::snapshot_every_events` events; recovery loads it and
+/// replays only the tail (log records with seq > `head_seq`). The FIRST
+/// field is the format version — unknown versions are rejected and the
+/// reader falls back to a full replay (zero-migration contract).
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionSnapshotFile {
+    /// Schema version of the snapshot format itself. Bump on any
+    /// incompatible shape change.
+    version: u32,
+    /// Highest seq included in `entries` (== next_seq at snapshot time).
+    head_seq: u64,
+    /// The retained in-memory ring at snapshot time.
+    entries: Vec<LedgerDiskRecord>,
+}
+
+const SESSION_SNAPSHOT_VERSION: u32 = 1;
+const SESSION_SNAPSHOT_FILE_NAME: &str = "snapshot.json";
 
 /// Result of parsing one disk line. A pre-Stage-5 persisted-message record
 /// has no representation in the v2-only core enum, so it is explicitly
@@ -1053,9 +1082,63 @@ impl UiProtocolLedger {
         let mut skipped_records = 0u64;
         let cap = self.config.retained_per_session;
 
+        // Step 1b: seed from the projection snapshot when one exists and
+        // validates. Log records with seq <= snapshot head are then
+        // skipped during the scan below, so recovery cost is
+        // O(snapshot + tail) instead of O(all events). A corrupt,
+        // unreadable, or unknown-version snapshot logs a warning and
+        // falls back to a full replay — the log stays the source of
+        // truth (fault-tolerance contract).
+        let mut skip_through_seq = 0u64;
+        match self.read_session_snapshot(session_id, session_dir) {
+            Ok(Some(snapshot)) => {
+                head_seq = snapshot.head_seq;
+                skip_through_seq = snapshot.head_seq;
+                for record in snapshot.entries {
+                    oldest_seq.get_or_insert(record.seq);
+                    if replay_after_seq.is_some_and(|after_seq| record.seq > after_seq) {
+                        replay_entries.push(LedgeredUiProtocolEvent {
+                            cursor: UiCursor {
+                                stream: session_id.0.clone(),
+                                seq: record.seq,
+                            },
+                            event: record.event.clone(),
+                            from_connection: None,
+                        });
+                    }
+                    let bytes = approx_event_bytes(&record.event);
+                    retained_entries.push_back(LedgerEntry {
+                        seq: record.seq,
+                        event: record.event,
+                        bytes,
+                    });
+                    while retained_entries.len() > cap {
+                        retained_entries.pop_front();
+                    }
+                }
+                debug!(
+                    target = "octos::ledger",
+                    session_id = %session_id.0,
+                    snapshot_head = skip_through_seq,
+                    "session recovery seeded from projection snapshot; replaying tail only"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target = "octos::ledger",
+                    ?error,
+                    session_id = %session_id.0,
+                    "session snapshot unusable; falling back to full log replay"
+                );
+            }
+        }
+
         for path in log_files {
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
+            // Read the whole file once and iterate borrowed line slices:
+            // with a snapshot seeded, the skip path then costs zero
+            // per-line allocations (the dominant recovery cost).
+            let buf = fs::read(&path)?;
             // Aggregate skip counts per file: emit ONE summary `warn!`
             // after the inner loop instead of one line per record per
             // rescan. `read_session_disk_snapshot` re-reads every log
@@ -1066,7 +1149,9 @@ impl UiProtocolLedger {
             let mut skipped_unknown_version = 0u64;
             let mut skipped_legacy_message_persisted = 0u64;
             let mut skipped_malformed = 0u64;
-            for line_result in reader.lines() {
+            for line_bytes in buf.split(|b| *b == b'\n') {
+                let line_result: std::io::Result<&str> = std::str::from_utf8(line_bytes)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
                 let line = match line_result {
                     Ok(line) => line,
                     Err(error) => {
@@ -1083,13 +1168,31 @@ impl UiProtocolLedger {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // Snapshot-seeded recovery fast path: records at or below
+                // the snapshot head are already materialised in the ring,
+                // so skip the expensive full event parse. We still extract
+                // the record's `seq` cheaply (a tiny partial JSON scan of
+                // the flat leading fields — the disk writer always emits
+                // `{"v":…,"seq":…,"event":…}` in that order) to keep
+                // `head_seq` advancing; a line whose seq can't be cheaply
+                // extracted falls through to the full parse below, which
+                // re-applies the same skip as a safety net.
+                if skip_through_seq > 0 {
+                    if let Some(seq) = cheap_record_seq(line) {
+                        if seq <= skip_through_seq {
+                            oldest_seq.get_or_insert(seq);
+                            head_seq = head_seq.max(seq);
+                            continue;
+                        }
+                    }
+                }
                 // Dual-read the outer event tag: canonical `record_kind`
                 // first, then the strict legacy `envelope`-tagged shim for
                 // pre-#1358 records (see `parse_ledger_disk_record`). Both
                 // parses are derived + strict — no `serde_json::Value`
                 // round-trip — so duplicate-key corruption is still
                 // rejected on either path.
-                let record = match parse_ledger_disk_record(&line) {
+                let record = match parse_ledger_disk_record(line) {
                     Ok(ParsedLedgerDiskRecord::Record(record))
                         if record.v == LEDGER_DISK_VERSION =>
                     {
@@ -1158,6 +1261,11 @@ impl UiProtocolLedger {
 
                 oldest_seq.get_or_insert(record.seq);
                 head_seq = head_seq.max(record.seq);
+
+                if record.seq <= skip_through_seq {
+                    // Already materialised from the projection snapshot.
+                    continue;
+                }
 
                 if replay_after_seq.is_some_and(|after_seq| record.seq > after_seq) {
                     replay_entries.push(LedgeredUiProtocolEvent {
@@ -2188,6 +2296,24 @@ impl UiProtocolLedger {
 
         inner.dropped_count = inner.dropped_count.saturating_add(dropped_now);
 
+        // Step 1b: snapshot cadence. Every `snapshot_every_events` seqs,
+        // persist the session's retained ring so the next recovery loads
+        // the snapshot and replays only the tail. Best-effort: a failed
+        // snapshot write never fails the append (the log is the source of
+        // truth; recovery falls back to a full replay).
+        let cadence = self.config.snapshot_every_events;
+        if cadence > 0 && cursor.seq % cadence == 0 {
+            if let Err(error) = self.write_session_snapshot_locked(session_id, session) {
+                warn!(
+                    target = "octos::ledger",
+                    ?error,
+                    session_id = %session_id.0,
+                    seq = cursor.seq,
+                    "failed to write session projection snapshot; recovery will full-replay"
+                );
+            }
+        }
+
         AppendLockedOutcome {
             cursor,
             stamped,
@@ -2367,6 +2493,92 @@ impl UiProtocolLedger {
         // documents this as a deliberate tradeoff.
         session.active_log_bytes = session.active_log_bytes.saturating_add(bytes);
         Ok((bytes, reclaimed))
+    }
+
+    /// Write the session's current retained ring to `snapshot.json` next
+    /// to its log files (atomic via tmp + rename). Callers hold `inner`;
+    /// this does NOT take any lock itself.
+    fn write_session_snapshot_locked(
+        &self,
+        session_id: &SessionKey,
+        session: &SessionLedger,
+    ) -> std::io::Result<()> {
+        let Some(dir) = &self.config.data_dir else {
+            return Ok(());
+        };
+        let session_dir = dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id));
+        fs::create_dir_all(&session_dir)?;
+        let snapshot = SessionSnapshotFile {
+            version: SESSION_SNAPSHOT_VERSION,
+            head_seq: session.next_seq,
+            entries: session
+                .entries
+                .iter()
+                .map(|entry| LedgerDiskRecord {
+                    v: LEDGER_DISK_VERSION,
+                    seq: entry.seq,
+                    event: entry.event.clone(),
+                })
+                .collect(),
+        };
+        let payload = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
+        let tmp_path = session_dir.join(format!("{SESSION_SNAPSHOT_FILE_NAME}.tmp"));
+        let final_path = session_dir.join(SESSION_SNAPSHOT_FILE_NAME);
+        fs::write(&tmp_path, payload)?;
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Read + validate the session's snapshot file. Returns `Ok(None)`
+    /// when absent (zero-migration: pre-1b ledgers simply have no
+    /// snapshot); returns `Err` on unreadable/corrupt/unknown-version
+    /// content so the caller can log and fall back to a full replay.
+    fn read_session_snapshot(
+        &self,
+        session_id: &SessionKey,
+        session_dir: &Path,
+    ) -> std::io::Result<Option<SessionSnapshotFile>> {
+        let path = session_dir.join(SESSION_SNAPSHOT_FILE_NAME);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let snapshot: SessionSnapshotFile = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("corrupt session snapshot {}: {error}", path.display()),
+            )
+        })?;
+        if snapshot.version != SESSION_SNAPSHOT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unknown session snapshot version {} (expected {SESSION_SNAPSHOT_VERSION})",
+                    snapshot.version
+                ),
+            ));
+        }
+        // Sanity: snapshot entries must be seq-ordered and ≤ head_seq —
+        // anything else means a torn write slipped past the tmp+rename.
+        let mut prev = 0u64;
+        for entry in &snapshot.entries {
+            if entry.seq <= prev || entry.seq > snapshot.head_seq {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "session snapshot {} has out-of-order/overrun seq {}",
+                        path.display(),
+                        entry.seq
+                    ),
+                ));
+            }
+            prev = entry.seq;
+        }
+        let _ = session_id;
+        Ok(Some(snapshot))
     }
 
     /// Rotate the session's active log file and trim retained history.
@@ -3118,6 +3330,29 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
 // SessionKey may contain characters illegal on common filesystems
 // (`:`, `/`, etc.). We hex-encode a stable representation so the
 // session dir name is reversible and collision-free.
+
+/// Cheaply extract the top-level `seq` from a ledger disk line WITHOUT
+/// parsing the nested event payload. The writer (`write_record_locked`)
+/// always serialises the flat struct in field order
+/// `{"v":…,"seq":N,"event":…}`, so a byte scan for `"seq":` before the
+/// `"event"` key suffices. Returns `None` for any shape we don't
+/// recognise — callers then fall back to the full strict parse.
+fn cheap_record_seq(line: &str) -> Option<u64> {
+    let seq_key = line.find("\"seq\":")?;
+    let event_key = line.find("\"event\"")?;
+    if seq_key > event_key {
+        return None; // nested/foreign layout — not our writer's shape
+    }
+    let start = seq_key + "\"seq\":".len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 fn encode_session_dir_name(session_id: &SessionKey) -> String {
     let mut out = String::with_capacity(session_id.0.len() * 2);
@@ -4319,6 +4554,157 @@ mod tests {
         // Appends to the good session continue unaffected.
         let next = outcome.ledger.append_notification(delta(&good, "g-4"));
         assert_eq!(next.cursor.seq, 5);
+    }
+
+    // ---- Per-session snapshots (perf/ledger-snapshot, step 1b) ---------
+    // Acceptance scenarios from .octos/OUTER_LOOP_REVIEW.md §1b.
+
+    fn snapshot_config(data_dir: &Path, every: u64) -> LedgerConfig {
+        let mut config = LedgerConfig::durable(data_dir.into());
+        config.snapshot_every_events = every;
+        config
+    }
+
+    fn snapshot_file_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
+        data_dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id))
+            .join(SESSION_SNAPSHOT_FILE_NAME)
+    }
+
+    /// Scenario 1 (equivalence): snapshot+tail recovery must produce a
+    /// projection field-for-field identical to a full replay of the same
+    /// ledger — and the snapshot file must exist with the right head.
+    #[test]
+    fn snapshot_plus_tail_equivalent_to_full_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-equiv".into());
+        {
+            let ledger = UiProtocolLedger::with_config(snapshot_config(temp.path(), 4));
+            for i in 1..=11 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let snap_path = snapshot_file_path(temp.path(), &session_id);
+        assert!(snap_path.exists(), "snapshot must be written at seq 4 & 8");
+        let raw: Value =
+            serde_json::from_slice(&fs::read(&snap_path).expect("read snapshot")).unwrap();
+        assert_eq!(raw["version"], SESSION_SNAPSHOT_VERSION as u64);
+        assert_eq!(raw["head_seq"], 8, "latest snapshot head after 11 events");
+
+        // Snapshot+tail path (lazy recover then hydrate).
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 4));
+        let (snap_events, snap_head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot+tail hydrate");
+        // Full-replay reference: snapshotting disabled.
+        let mut full_config = snapshot_config(temp.path(), 4);
+        full_config.snapshot_every_events = 0;
+        let reference = UiProtocolLedger::recover(full_config);
+        let (full_events, full_head) = reference
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("full replay hydrate");
+
+        assert_eq!(snap_head, full_head);
+        let snap_dbg: Vec<String> = snap_events.iter().map(|e| format!("{e:?}")).collect();
+        let full_dbg: Vec<String> = full_events.iter().map(|e| format!("{e:?}")).collect();
+        assert_eq!(
+            snap_dbg, full_dbg,
+            "snapshot+tail projection must equal full-replay projection"
+        );
+        assert_eq!(replay_texts(&snap_events).len(), 11);
+        // Next append continues the seq space correctly.
+        let next = outcome
+            .ledger
+            .append_notification(delta(&session_id, "ev-12"));
+        assert_eq!(next.cursor.seq, 12);
+    }
+
+    /// Scenario 2 (fault tolerance): a corrupt snapshot must NOT lose data
+    /// — recovery logs a warning and falls back to a full replay.
+    #[test]
+    fn corrupt_snapshot_falls_back_to_full_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-corrupt".into());
+        {
+            let ledger = UiProtocolLedger::with_config(snapshot_config(temp.path(), 2));
+            for i in 1..=6 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let snap_path = snapshot_file_path(temp.path(), &session_id);
+        assert!(snap_path.exists());
+        fs::write(&snap_path, b"{ not json !!").expect("corrupt snapshot");
+
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 2));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("corrupt snapshot must not break recovery");
+        assert_eq!(head.seq, 6);
+        assert_eq!(
+            replay_texts(&events),
+            vec!["ev-1", "ev-2", "ev-3", "ev-4", "ev-5", "ev-6"],
+            "full replay must recover everything despite corrupt snapshot"
+        );
+
+        // Unknown-version snapshot also falls back.
+        fs::write(
+            &snap_path,
+            serde_json::to_vec(&json!({
+                "version": 999,
+                "head_seq": 6,
+                "entries": [],
+            }))
+            .unwrap(),
+        )
+        .expect("write unknown-version snapshot");
+        let outcome2 = UiProtocolLedger::recover(snapshot_config(temp.path(), 2));
+        let (events2, head2) = outcome2
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("unknown-version snapshot must fall back");
+        assert_eq!(head2.seq, 6);
+        assert_eq!(replay_texts(&events2).len(), 6);
+    }
+
+    /// Scenario 3 (zero migration): a pre-1b ledger with NO snapshot file
+    /// reads exactly as before.
+    #[test]
+    fn ledger_without_snapshot_reads_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-none".into());
+        {
+            let mut config = snapshot_config(temp.path(), 4);
+            config.snapshot_every_events = 0; // simulate a pre-1b writer
+            let ledger = UiProtocolLedger::with_config(config);
+            for i in 1..=7 {
+                ledger.append_notification(delta(&session_id, &format!("old-{i}")));
+            }
+        }
+        assert!(
+            !snapshot_file_path(temp.path(), &session_id).exists(),
+            "pre-1b ledger has no snapshot file"
+        );
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 4));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("legacy ledger must replay fully");
+        assert_eq!(head.seq, 7);
+        assert_eq!(replay_texts(&events).len(), 7);
+        // And once the new writer touches it, snapshots start appearing.
+        for i in 8..=12 {
+            outcome
+                .ledger
+                .append_notification(delta(&session_id, &format!("new-{i}")));
+        }
+        assert!(
+            snapshot_file_path(temp.path(), &session_id).exists(),
+            "snapshot appears at the next cadence boundary (seq 8/12)"
+        );
     }
 
     #[test]
