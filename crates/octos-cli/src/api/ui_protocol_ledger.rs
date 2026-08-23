@@ -839,6 +839,18 @@ impl UiProtocolLedger {
                 _ => return false,
             }
         };
+        // Outer-review 1b fix: existing large ledgers must not wait for
+        // the append cadence to earn their FIRST snapshot. Detect whether
+        // this recovery could use a projection snapshot BEFORE the scan:
+        // `None` (no snapshot yet — pre-1b ledger) or `Err` (corrupt —
+        // fault path) both mean the scan below is a full replay, after
+        // which we bootstrap-write a snapshot so the NEXT recovery is
+        // snapshot+tail. `Ok(Some(_))` means the scan already benefited.
+        let needs_bootstrap_snapshot = self.config.snapshot_every_events > 0
+            && !matches!(
+                self.read_session_snapshot(storage_id, &session_dir),
+                Ok(Some(_))
+            );
         let snapshot = match self.read_session_disk_snapshot(storage_id, &session_dir, None) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -896,6 +908,30 @@ impl UiProtocolLedger {
             #[cfg(test)]
             self.lazy_replays
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Bootstrap snapshot (outer-review 1b fix): a full replay just
+            // paid O(all events) — persist the projection NOW so the next
+            // cold start recovers this session from snapshot+tail instead.
+            // Best-effort, same discipline as the append-cadence path: a
+            // failed write never breaks recovery.
+            if needs_bootstrap_snapshot {
+                let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(session) = inner.sessions.get(storage_id) {
+                    if let Err(error) = self.write_session_snapshot_locked(storage_id, session) {
+                        warn!(
+                            target = "octos::ledger",
+                            ?error,
+                            session_id = %storage_id.0,
+                            "failed to write bootstrap snapshot after full replay"
+                        );
+                    } else {
+                        debug!(
+                            target = "octos::ledger",
+                            session_id = %storage_id.0,
+                            "bootstrap snapshot written after full replay"
+                        );
+                    }
+                }
+            }
         }
         if hydrated_now && !reconciled {
             // The process that wrote these events is gone; rows it left
@@ -4704,6 +4740,61 @@ mod tests {
         assert!(
             snapshot_file_path(temp.path(), &session_id).exists(),
             "snapshot appears at the next cadence boundary (seq 8/12)"
+        );
+    }
+
+    /// Outer-review 1b fix: an existing (pre-1b) ledger with NO snapshot
+    /// must earn a bootstrap snapshot on its first touch (the full-replay
+    /// path), so the SECOND recovery runs snapshot+tail — the operator's
+    /// 45MB main session never waits for the append cadence.
+    #[test]
+    fn existing_ledger_bootstraps_snapshot_on_first_touch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-bootstrap".into());
+        {
+            let mut config = snapshot_config(temp.path(), 4096);
+            config.snapshot_every_events = 0; // pre-1b writer: no snapshots
+            let ledger = UiProtocolLedger::with_config(config);
+            for i in 1..=10 {
+                ledger.append_notification(delta(&session_id, &format!("old-{i}")));
+            }
+        }
+        let snap_path = snapshot_file_path(temp.path(), &session_id);
+        assert!(!snap_path.exists(), "pre-1b ledger has no snapshot");
+
+        // First touch under the 1b writer: full replay happens AND the
+        // bootstrap snapshot is written immediately.
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 4096));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("first touch hydrates");
+        assert_eq!(head.seq, 10);
+        assert_eq!(replay_texts(&events).len(), 10);
+        assert!(
+            snap_path.exists(),
+            "full replay must bootstrap-write snapshot.json on first touch"
+        );
+        let raw: Value =
+            serde_json::from_slice(&fs::read(&snap_path).expect("read snapshot")).unwrap();
+        assert_eq!(raw["version"], SESSION_SNAPSHOT_VERSION as u64);
+        assert_eq!(raw["head_seq"], 10);
+
+        // Second recovery: projection still equivalent (snapshot+tail
+        // path — the bootstrap snapshot is used, logs only contribute
+        // the empty tail).
+        drop(outcome);
+        let outcome2 = UiProtocolLedger::recover(snapshot_config(temp.path(), 4096));
+        let (events2, head2) = outcome2
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("second recovery hydrates from snapshot+tail");
+        assert_eq!(head2.seq, 10);
+        let dbg1: Vec<String> = events.iter().map(|e| format!("{e:?}")).collect();
+        let dbg2: Vec<String> = events2.iter().map(|e| format!("{e:?}")).collect();
+        assert_eq!(
+            dbg1, dbg2,
+            "snapshot+tail projection must match full replay"
         );
     }
 
