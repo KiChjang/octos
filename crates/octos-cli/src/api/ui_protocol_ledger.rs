@@ -1143,9 +1143,15 @@ impl UiProtocolLedger {
             Ok(Some(snapshot)) => {
                 head_seq = snapshot.head_seq;
                 let snapshot_oldest = snapshot.entries.first().map(|r| r.seq);
+                // Valid ledger seqs start at 1; a snapshot entry with seq 0 is
+                // corrupt and must degrade to the full-replay path (shortcut
+                // off) — never a debug-build panic (the old bare `oldest - 1`)
+                // and never a shortcut seeded from corrupt data. The additive
+                // form `after + 1 >= oldest` avoids the underflow entirely.
                 let shortcut_ok = match replay_after_seq {
-                    Some(after) => snapshot_oldest.is_some_and(|oldest| after >= oldest - 1),
-                    None => snapshot_oldest.is_some_and(|oldest| oldest <= 1),
+                    Some(after) => snapshot_oldest
+                        .is_some_and(|oldest| oldest >= 1 && after.saturating_add(1) >= oldest),
+                    None => snapshot_oldest.is_some_and(|oldest| oldest == 1),
                 };
                 if shortcut_ok {
                     skip_through_seq = snapshot.head_seq;
