@@ -1125,38 +1125,80 @@ impl UiProtocolLedger {
         // unreadable, or unknown-version snapshot logs a warning and
         // falls back to a full replay — the log stays the source of
         // truth (fault-tolerance contract).
+        //
+        // ymote P1 (PR #2114 review): the snapshot shortcut must be
+        // CONDITIONAL on the requested replay range. When the caller asks
+        // to replay from a cursor OLDER than the snapshot's oldest entry
+        // (e.g. cursor 2000 while the snapshot ring only covers
+        // 4097..8192), the retained JSONL still holds the pre-snapshot
+        // records and they MUST be replayed — seeding the bounded ring
+        // and skipping everything ≤ head would silently drop
+        // 2001..4096 AND misreport cursor_out_of_range (oldest_seq taken
+        // from the snapshot ring). So: only skip log records up to the
+        // snapshot head when the requested range is fully covered by the
+        // snapshot; otherwise scan the log from seq 0 (the snapshot ring
+        // still seeds the retained ring, but nothing is skipped).
         let mut skip_through_seq = 0u64;
         match self.read_session_snapshot(session_id, session_dir) {
             Ok(Some(snapshot)) => {
                 head_seq = snapshot.head_seq;
-                skip_through_seq = snapshot.head_seq;
+                let snapshot_oldest = snapshot.entries.first().map(|r| r.seq);
+                let shortcut_ok = match replay_after_seq {
+                    Some(after) => snapshot_oldest.is_some_and(|oldest| after >= oldest - 1),
+                    None => snapshot_oldest.is_some_and(|oldest| oldest <= 1),
+                };
+                if shortcut_ok {
+                    skip_through_seq = snapshot.head_seq;
+                }
+                // NOTE: when the shortcut is disabled we deliberately do
+                // NOT seed anything from the snapshot (see the loop
+                // below) — the log scan rebuilds the full retained ring
+                // and replay in seq order, so there is nothing to dedupe
+                // and snapshot_seeded_floor/oldest stay 0.
                 for record in snapshot.entries {
                     oldest_seq.get_or_insert(record.seq);
-                    if replay_after_seq.is_some_and(|after_seq| record.seq > after_seq) {
-                        replay_entries.push(LedgeredUiProtocolEvent {
-                            cursor: UiCursor {
-                                stream: session_id.0.clone(),
-                                seq: record.seq,
-                            },
-                            event: record.event.clone(),
-                            from_connection: None,
+                    // ymote P1: only the SHORTCUT path materialises the
+                    // snapshot (retained ring + replay_entries). When the
+                    // shortcut is disabled the FULL state (retained ring
+                    // AND replay) is rebuilt by the log scan below in seq
+                    // order — seeding here would duplicate the tail and
+                    // mis-order the pre-snapshot gap in both.
+                    if shortcut_ok {
+                        if replay_after_seq.is_some_and(|after| record.seq > after) {
+                            replay_entries.push(LedgeredUiProtocolEvent {
+                                cursor: UiCursor {
+                                    stream: session_id.0.clone(),
+                                    seq: record.seq,
+                                },
+                                event: record.event.clone(),
+                                from_connection: None,
+                            });
+                        }
+                        let bytes = approx_event_bytes(&record.event);
+                        retained_entries.push_back(LedgerEntry {
+                            seq: record.seq,
+                            event: record.event,
+                            bytes,
                         });
+                        while retained_entries.len() > cap {
+                            retained_entries.pop_front();
+                        }
                     }
-                    let bytes = approx_event_bytes(&record.event);
-                    retained_entries.push_back(LedgerEntry {
-                        seq: record.seq,
-                        event: record.event,
-                        bytes,
-                    });
-                    while retained_entries.len() > cap {
-                        retained_entries.pop_front();
-                    }
+                }
+                if !shortcut_ok {
+                    // Pre-snapshot range requested: the snapshot ring only
+                    // seeds the retained window; oldest_seq must be
+                    // re-derived from the FULL log scan below, so reset it
+                    // (its snapshot-derived value would wrongly bound the
+                    // cursor_out_of_range check to the snapshot window).
+                    oldest_seq = None;
                 }
                 debug!(
                     target = "octos::ledger",
                     session_id = %session_id.0,
-                    snapshot_head = skip_through_seq,
-                    "session recovery seeded from projection snapshot; replaying tail only"
+                    snapshot_head = snapshot.head_seq,
+                    shortcut_ok,
+                    "session recovery seeded from projection snapshot"
                 );
             }
             Ok(None) => {}
@@ -1299,7 +1341,10 @@ impl UiProtocolLedger {
                 head_seq = head_seq.max(record.seq);
 
                 if record.seq <= skip_through_seq {
-                    // Already materialised from the projection snapshot.
+                    // Already materialised from the projection snapshot
+                    // (shortcut path only — when the shortcut is disabled
+                    // the log scan rebuilds everything, skip_through_seq
+                    // stays 0 and nothing is skipped here).
                     continue;
                 }
 
@@ -4606,6 +4651,59 @@ mod tests {
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id))
             .join(SESSION_SNAPSHOT_FILE_NAME)
+    }
+
+    /// ymote P1 regression (PR #2114 review): ring=2, snapshot at seq 4 —
+    /// replay after seq 1 MUST return seq 2..5. The snapshot shortcut
+    /// must NOT skip the pre-snapshot range (the retained JSONL still
+    /// holds it), and oldest_seq must come from the full log so the
+    /// cursor is not falsely reported out_of_range. Note the pre-existing
+    /// equivalence test could not catch this hole because it ran with
+    /// snapshot_every_events=0 on the reference path (which disables
+    /// snapshot WRITES but not the snapshot READ being tested here).
+    #[test]
+    fn snapshot_shortcut_replays_pre_snapshot_range() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:ymote-p1".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        // ring=2 (retained_per_session=2), snapshot_every=4 → snapshot at seq 4.
+        let mut config = snapshot_config(temp.path(), 4);
+        config.retained_per_session = 2;
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for i in 1..=5 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        // Snapshot file exists with head 4, ring covers only seq 3..4
+        // (retained 2); the JSONL log still holds seq 1..5.
+        let raw: Value = serde_json::from_slice(
+            &fs::read(snapshot_file_path(temp.path(), &session_id)).expect("snapshot"),
+        )
+        .expect("snapshot json");
+        assert_eq!(raw["head_seq"], 4, "snapshot at seq 4");
+
+        // Replay after seq 1 → must return seq 2,3,4,5 (NOT 5 only, NOT
+        // cursor_out_of_range). Drive read_session_disk_snapshot directly
+        // with replay_after_seq = Some(1).
+        let ledger = UiProtocolLedger::with_config(config);
+        let snap = ledger
+            .read_session_disk_snapshot(&session_id, &session_dir, Some(1))
+            .expect("read ok")
+            .expect("snapshot exists");
+        let seqs: Vec<u64> = snap.replay_entries.iter().map(|e| e.cursor.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 3, 4, 5],
+            "pre-snapshot range must be replayed from the retained log"
+        );
+        // oldest_seq from the FULL log (1), not the snapshot ring (3), so
+        // a cursor at seq 1 is not falsely out_of_range.
+        assert_eq!(snap.oldest_seq, Some(1));
+        assert_eq!(snap.head_seq, 5);
     }
 
     /// Scenario 1 (equivalence): snapshot+tail recovery must produce a
