@@ -1497,7 +1497,20 @@ impl InProcessAgentOrchestrator {
     /// `ledger.set_session_scope` so the goal store and the ledger agree on
     /// each session's cwd scope. Mirrors
     /// [`UiProtocolLedger::set_session_scope`].
-    pub(crate) fn set_goal_scope(&self, session_id: &SessionKey, scope: Option<String>) {
+    /// Returns the goal-store key this registration establishes for
+    /// `session_id`, computed INSIDE the same `goal_scopes` lock acquisition
+    /// (#2065): registration and capture used to be two
+    /// separate lock acquisitions (`set_goal_scope` then `scoped_goal_key`),
+    /// a TOCTOU on a multi-thread runtime — a concurrent same-wire open
+    /// could flip the last-writer-wins map between them and the caller
+    /// would pin the OTHER open's key. A caller that pins the RETURNED key
+    /// cannot observe an interleaved flip; the race is unrepresentable at
+    /// this capture site.
+    pub(crate) fn set_goal_scope(
+        &self,
+        session_id: &SessionKey,
+        scope: Option<String>,
+    ) -> SessionKey {
         // #1973 fix-round 4b — GC snapshot: the scoped-goal keys currently in
         // the store, taken (and the state lock RELEASED) BEFORE the
         // goal_scopes lock — the two locks must never nest in that order
@@ -1508,6 +1521,12 @@ impl InProcessAgentOrchestrator {
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Same injective encoding as `scoped_goal_key`, evaluated under THIS
+        // lock so it reflects exactly the registration below.
+        let registered_key = match scope.as_deref() {
+            Some(scope) => SessionKey(format!("{}\u{0}~cwd-{scope}", session_id.0)),
+            None => session_id.clone(),
+        };
         let changed = match scope {
             Some(scope) => {
                 self.mark_scope_wire_live(session_id);
@@ -1522,6 +1541,7 @@ impl InProcessAgentOrchestrator {
         if changed {
             self.persist_goal_scopes_locked(&scopes, Some(&gc_live_goal_keys));
         }
+        registered_key
     }
 
     /// PR 4b — register `scope` for `session_id` ONLY when no scope is registered
@@ -3825,7 +3845,9 @@ impl InProcessAgentOrchestrator {
         }
         // #1959 (codex #1) — stamp the generation like every other goal-event
         // producer so the send guard can order this token-charge update.
-        let generation = next_goal_event_generation(&mut state);
+        // #2065: watermark identity = the scoped key this charge mutated
+        // under (per-scope guard streams).
+        let generation = next_goal_event_generation(&mut state, &key);
         // #1966 — the event carries the WIRE key: clients key goal chips by
         // the wire session id, never the internal scoped storage form.
         Some(json!({
@@ -4564,7 +4586,9 @@ impl InProcessAgentOrchestrator {
         let wire_id = wire_key_from_goal_key(session_id);
         // #1959 — stamp a monotonic generation so a stale update can't
         // resurrect a cleared goal on the client (see the field's doc comment).
-        let generation = next_goal_event_generation(&mut state);
+        // #2065: the watermark identity is the SCOPED key this fn looked up
+        // under (the caller's turn-pinned key), not the wire id emitted.
+        let generation = next_goal_event_generation(&mut state, session_id);
         Some(json!({
             "session_id": wire_id,
             "profile_id": profile_id,
@@ -4572,6 +4596,34 @@ impl InProcessAgentOrchestrator {
             "generation": generation,
             "transition_actor": "backend",
         }))
+    }
+
+    /// #2065 — the SCOPED goal-store key a goal event's `generation` was
+    /// built from, registered at allocation time by
+    /// [`next_goal_event_generation`]. The transport's #1959 send guard
+    /// keys its watermark map by THIS identity rather than the plain wire
+    /// session id the frames carry (falling back to the wire id for
+    /// unstamped/unregistered generations — legacy events, hand-built test
+    /// frames, FIFO-evicted entries).
+    ///
+    /// Two cwd scopes can share one wire session id (`appui.sessions_in_cwd`
+    /// — the same session key opened from two folders), and the guard is
+    /// strictly monotonic per key. Wire-keyed, the two scopes shared one
+    /// watermark, so scope A's later-ALLOCATED clear suppressed scope B's
+    /// earlier-built repaint when B's frame reached the guard second: B's
+    /// live goal chip silently stopped repainting. Per-scope identities
+    /// keep the two streams independent, which is what the guard's
+    /// monotonicity assumption requires. The four goal-event producers
+    /// (set / clear / token-charge / turn repaint) all allocate through
+    /// [`next_goal_event_generation`], so every stamped frame is covered.
+    pub(crate) fn goal_event_watermark_key(&self, generation: u64) -> Option<SessionKey> {
+        if generation == 0 {
+            return None;
+        }
+        self.state()
+            .goal_event_scope_index
+            .get(&generation)
+            .cloned()
     }
 
     /// #1696 — read-only goal snapshot for the model's `goal_get` tool.
@@ -5561,8 +5613,9 @@ impl InProcessAgentOrchestrator {
             // `SessionGoalUpdated` so the client can order a clear against a
             // racing stale update. A stale update always bumps before this
             // clear (its goal read preceded the removal above), so
-            // `update.generation < clear.generation`.
-            let generation = next_goal_event_generation(&mut state);
+            // `update.generation < clear.generation`. #2065: watermark
+            // identity = the scoped key this clear resolved and removed under.
+            let generation = next_goal_event_generation(&mut state, &key);
             let fleet_store = state.fleet_store.clone();
             (removed, generation, fleet_store)
         };
@@ -9428,7 +9481,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // #1959 (codex #1) — stamp the generation so a user-set goal update
         // participates in the send guard's ordering (it is durable, so an
         // unstamped one could persist a clear->stale-update inversion).
-        let generation = next_goal_event_generation(&mut state);
+        // #2065: watermark identity = the scoped key this set stored under.
+        let generation = next_goal_event_generation(&mut state, &key);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
@@ -11071,6 +11125,17 @@ struct AutonomyRuntimeState {
     /// emit no event), so `stale_update.generation < clear.generation` always
     /// holds and the client keeps the newer clear.
     goal_event_generation: u64,
+    /// #2065 — generation → the SCOPED goal-store key the event was built
+    /// from, registered atomically with the allocation (same state lock).
+    /// The transport's #1959 send guard keys its watermark by THIS
+    /// identity, not the plain wire session id: two cwd scopes can share a
+    /// wire id, and a wire-keyed watermark advanced by one scope's
+    /// later-allocated clear falsely dropped the sibling scope's
+    /// earlier-built repaint at the guard. Bounded FIFO — see
+    /// [`next_goal_event_generation`].
+    goal_event_scope_index: HashMap<u64, SessionKey>,
+    /// FIFO eviction order for [`Self::goal_event_scope_index`].
+    goal_event_scope_fifo: std::collections::VecDeque<u64>,
     /// #991 / M15-B — per-agent cancellation handles registered by
     /// `run_native_specialist` (and future specialist runners) so that
     /// `interrupt_agent` / `close_agent` can signal a *real* abort to
@@ -13461,9 +13526,34 @@ fn restored_agent_artifact(artifact: &SupervisorArtifactRecord) -> AgentArtifact
 /// An unstamped (`0`) event is always admitted by the guard and would reopen
 /// the stale-update-overtakes-clear race (codex #1 caught `set_goal` /
 /// `charge_active_goal_tokens` shipping unstamped).
-fn next_goal_event_generation(state: &mut AutonomyRuntimeState) -> u64 {
+///
+/// #2065 — the allocation also registers `watermark_key`, the SCOPED
+/// goal-store key the event is being built from (the compiler forces every
+/// producer to supply its build-time key — never a later re-resolution of
+/// the last-writer-wins cwd map, which a concurrent same-wire open flips).
+/// The transport's #1959 send guard keys its watermark by this identity via
+/// [`InProcessAgentOrchestrator::goal_event_watermark_key`], so two cwd
+/// scopes sharing one wire session id keep independent, independently
+/// monotonic guard streams — without it, one scope's later-allocated clear
+/// suppressed the sibling scope's earlier-built repaint at the guard. The
+/// registry is a bounded FIFO: at 4096 live entries the oldest is evicted,
+/// and an evicted generation falls back to wire-keyed watermarking at the
+/// guard (strictly the pre-fix behavior, and only for events ~4096
+/// generations stale).
+fn next_goal_event_generation(state: &mut AutonomyRuntimeState, watermark_key: &SessionKey) -> u64 {
+    const GOAL_EVENT_SCOPE_INDEX_CAP: usize = 4096;
     state.goal_event_generation += 1;
-    state.goal_event_generation
+    let generation = state.goal_event_generation;
+    state
+        .goal_event_scope_index
+        .insert(generation, watermark_key.clone());
+    state.goal_event_scope_fifo.push_back(generation);
+    while state.goal_event_scope_fifo.len() > GOAL_EVENT_SCOPE_INDEX_CAP {
+        if let Some(evicted) = state.goal_event_scope_fifo.pop_front() {
+            state.goal_event_scope_index.remove(&evicted);
+        }
+    }
+    generation
 }
 
 fn persist_goal_state(

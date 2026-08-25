@@ -802,6 +802,64 @@ impl WsConnection {
         }
     }
 
+    /// #2065 — await-safe durable enqueue for the live-forwarder task. The
+    /// stdio durable lane (`enqueue_durable_or_lifecycle`) is a BLOCKING
+    /// `SyncSender::send`: correct backpressure on a blocking-capable
+    /// caller, but an executor-worker stall when a full stdio queue parks
+    /// an async task — and hopping it to `spawn_blocking` trades that for
+    /// a worse hazard, because an in-flight blocking closure survives the
+    /// task's abort and can enqueue a stale frame AFTER the lane was
+    /// retired. Here the stdio lane instead parks COOPERATIVELY: a
+    /// non-blocking `try_send` probe with a bounded async sleep between
+    /// probes. That keeps the stdio never-drop durable semantics (the frame
+    /// waits for capacity, exactly like the blocking send did), never
+    /// occupies an executor worker, and is cancellable at every await with
+    /// an ATOMIC enqueue: after abort+join there is no
+    /// detached in-flight work that could still enqueue. The WS lane keeps
+    /// its non-blocking `try_send`+`replay_lossy` semantics via
+    /// [`Self::send_durable`], byte-identical to the sync callers.
+    async fn send_durable_offloaded(
+        &self,
+        frame: WsMessage,
+        method: &str,
+    ) -> Result<(), SendError> {
+        if self.stdio_writer.is_none() {
+            return self.send_durable(frame, method);
+        }
+        const CAPACITY_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(15);
+        let mut frame = frame;
+        loop {
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SendError::FatalClosed);
+            }
+            let writer = self
+                .stdio_writer
+                .as_ref()
+                .expect("stdio_writer checked above");
+            match writer.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    frame = returned;
+                    tokio::time::sleep(CAPACITY_PROBE_WINDOW).await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    // Mirror `send_durable`'s Closed accounting.
+                    metrics::counter!("ws.send.drop.closed", "method" => method.to_string())
+                        .increment(1);
+                    metrics::counter!("ws.send.error.durable", "method" => method.to_string())
+                        .increment(1);
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        method,
+                        reason = "closed",
+                        "durable ws send failed; client gone"
+                    );
+                    return Err(SendError::Closed);
+                }
+            }
+        }
+    }
+
     /// Dedicated writer-task loop: drains the channel into the actual sink.
     ///
     /// Exits on the first sink error (peer gone) or once all senders drop.
@@ -3964,7 +4022,7 @@ fn register_session_ledger_scope(
     // what makes the goal store isolate cwds exactly as the transcript already
     // does. The goal continuation dispatch strips this scope back to the wire
     // key when it reaches the session runtime / actor.
-    default_agent_orchestrator().set_goal_scope(&runtime.session_key, scope.clone());
+    let _ = default_agent_orchestrator().set_goal_scope(&runtime.session_key, scope.clone());
     // Topic-suffixed sessions also emit ledger events under their BASE key:
     // the alpha-9 file/visual bridges deliberately strip the `#topic` before
     // appending so base-bucket subscribers see them (see
@@ -3975,7 +4033,7 @@ fn register_session_ledger_scope(
     let base = runtime.session_key.base_key();
     if base != runtime.session_key.0 {
         ledger.set_session_scope(&SessionKey(base.to_owned()), scope.clone());
-        default_agent_orchestrator().set_goal_scope(&SessionKey(base.to_owned()), scope);
+        let _ = default_agent_orchestrator().set_goal_scope(&SessionKey(base.to_owned()), scope);
     }
 }
 
@@ -16963,6 +17021,35 @@ async fn handle_session_open(
     let session_id_for_subscribe = params.session_id.clone();
     let live_rx = ledger.subscribe(&session_id_for_subscribe);
 
+    // #2065 — retire the PREVIOUS forwarder for this session BEFORE
+    // `open_session_result` computes the replay baseline (order: subscribe
+    // new receiver → retire old lane → baseline → replay → response →
+    // pump). With the old order the previous pump stayed live through the
+    // new replay window and could deliver a post-baseline event
+    // CONCURRENTLY with the replay that also carries it. abort+join fully
+    // retires the lane:
+    // every await point in the forwarder (recv, the offloaded send's
+    // capacity park) is cancellable, and an enqueue is an atomic
+    // `try_send` — there is no detached in-flight segment for the join to
+    // miss (see `send_durable_offloaded`).
+    //
+    // Delivery semantics across the handover are AT-LEAST-ONCE, not
+    // exactly-once (#2065, tracked): a durable frame the
+    // old lane already delivered may be re-delivered by this open's replay
+    // (the client's `after` cursor lags what was enqueued), and the client
+    // merges durable frames by id/cursor — the normal reconnect-replay
+    // overlap every reopen already has. What the retire-before-baseline
+    // order guarantees is the absence of CONCURRENT old-pump/new-replay
+    // delivery, not global dedupe.
+    let previous_forwarder = live_forwarders
+        .lock()
+        .await
+        .remove(&session_id_for_subscribe);
+    if let Some(previous) = previous_forwarder {
+        previous.abort();
+        let _ = previous.await;
+    }
+
     let mut outcome = match open_session_result(
         state,
         ledger,
@@ -17122,10 +17209,10 @@ async fn handle_session_open(
     let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
 
-    // Hand the broadcast receiver to a per-session forwarder. The previous
-    // forwarder for this session on this connection (if any) is aborted —
-    // a re-`session/open` always restarts the live pump from a fresh
-    // baseline cursor.
+    // Hand the broadcast receiver to the per-session live pump. The
+    // previous forwarder was already retired BEFORE the replay baseline
+    // was computed (W6.1, top of this function); the in-spawn retire is an
+    // idempotent second line of defense for direct callers.
     spawn_live_forwarder(
         ws.clone(),
         ledger_for_forwarder,
@@ -17404,12 +17491,98 @@ fn stdio_session_open_candidate_profile(
         .or_else(|| current_profile_id.map(ToOwned::to_owned))
 }
 
+/// Deliver one live broadcast ledger event to `ws` through the forwarder's
+/// full filter pipeline: baseline cursor (events `<= baseline_seq` were
+/// already shipped via replay), self-connection dedupe (Codex MUST-FIX-2 —
+/// the originating handler already direct-sent the wire frame on this
+/// connection; other connections still receive it via fan-out), topic
+/// scope, profile scope, v2 projection (before the capability gate so a v2
+/// connection evaluates `EnvelopeV2` while legacy/v1 connections keep the
+/// original event byte-for-byte), and the per-connection capability filter.
+///
+/// The per-event body of `spawn_live_forwarder`'s pump loop. `Ok(())`
+/// covers "sent", "filtered", AND backpressure
+/// (`send_ledger_event_durable` already opportunistically emits
+/// `replay_lossy`; the caller keeps pumping so a recovered consumer gets
+/// caught up). `Err` is only the #924 BLOCK 2 writer-fatal pair — a closed
+/// writer OR a latched failure both mean further pumps produce FatalClosed
+/// forever, so the caller must stop spinning.
+#[allow(clippy::too_many_arguments)]
+async fn forward_live_ledger_event(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    event: LedgeredUiProtocolEvent,
+    baseline_seq: u64,
+    self_connection_id: ConnectionId,
+    features: ConnectionUiFeatures,
+    topic_scope: Option<&str>,
+    profile_scope: Option<&str>,
+) -> Result<(), SendError> {
+    if event.cursor.seq <= baseline_seq {
+        return Ok(());
+    }
+    if event.from_connection == Some(self_connection_id) {
+        return Ok(());
+    }
+    if !ledger_event_matches_topic_scope(&event.event, topic_scope) {
+        return Ok(());
+    }
+    // #2067 (H2) — the profile scope is captured at session/open, never
+    // re-read from the connection: a later `session/open` on the same
+    // connection can resolve a different profile, and the shared cell would
+    // retarget this pump mid-flight.
+    if !ledger_event_matches_profile_scope(&event.event, profile_scope) {
+        return Ok(());
+    }
+    let projected = features
+        .projection_envelope_v2
+        .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
+        .flatten();
+    let event_for_wire = projected.unwrap_or(event.event);
+    if !live_event_passes_capability_filter(&event_for_wire, features) {
+        return Ok(());
+    }
+    // #2065 — await-safe send: a full stdio
+    // queue parks THIS task cooperatively (non-blocking probe + async
+    // sleep), never a blocking `SyncSender::send` on any thread — so the
+    // park is cancellable and an abort+join retires it with no detached
+    // in-flight work.
+    match send_ledger_event_durable_offloaded(ws, ledger, event_for_wire).await {
+        Err(err @ (SendError::Closed | SendError::FatalClosed)) => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// Slow consumer fell behind the broadcast ring. The ledger is durable; the
+/// client's cursor is the source of truth and a follow-up session/hydrate
+/// or reconnect with the last cursor catches them up. This is also the
+/// server-side gap detection point for v2: the live projection stream
+/// skipped durable records and the client must rehydrate from its cursor.
+fn log_live_forwarder_lag(session_id: &SessionKey, skipped: u64, features: ConnectionUiFeatures) {
+    if features.projection_envelope_v2 {
+        metrics::counter!("octos_ui_protocol_v2_replay_gap_total").increment(1);
+    }
+    tracing::warn!(
+        target: "octos::ui_protocol::ws",
+        session_id = %session_id.0,
+        skipped_events = skipped,
+        "live ledger forwarder lagged; client must rehydrate via cursor"
+    );
+}
+
 /// Pump live ledger events for `session_id` into the connection's WS write
 /// channel. Filters out events with `cursor.seq <= baseline_seq` (which
 /// were already shipped via replay) and applies the same capability
 /// gating as the live-emit path. The task ends when the WS write channel
 /// closes (peer gone), the broadcast sender is dropped (rare), or the
 /// connection cleanup aborts the handle.
+///
+/// #2065 — every await point here (recv, the offloaded send's capacity
+/// park) is cancellable and every enqueue is an atomic `try_send`, so
+/// abort+join retires the lane with no detached in-flight work: an
+/// uncancellable `spawn_blocking(SyncSender::send)` used to be able to
+/// outlive the abort and enqueue a stale frame onto the replacement lane.
+/// See `send_durable_offloaded`.
 // Each parameter is an independent piece of the forwarder's runtime state
 // (connection, ledger, replay baseline, negotiated features, broadcast
 // receiver); grouping them would only obscure the per-connection wiring.
@@ -17422,11 +17595,6 @@ async fn spawn_live_forwarder(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<String>,
-    // #2067 (H2) — the profile this SESSION resolved to at `session/open`,
-    // captured immutably for the lifetime of this forwarder exactly like
-    // `topic_scope`. Never re-read from the connection: a later
-    // `session/open` on the same connection can resolve a different profile,
-    // and a shared cell would retarget this pump mid-flight.
     profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
@@ -17448,85 +17616,58 @@ async fn spawn_live_forwarder(
     // `projection.envelope.v1` client did not negotiate to receive.
     ws.update_live_features(features);
 
+    // #2065 — retire any PREVIOUS forwarder for
+    // this session BEFORE the replacement exists, so "one live lane per
+    // (connection, session)" holds across re-opens. The production open
+    // path already retired it even earlier — before the replay baseline
+    // was computed (see `handle_session_open`) — so this is
+    // an idempotent second line of defense for direct callers. abort+join
+    // is a full retirement: cancellation lands at a recv/park await and
+    // enqueues are atomic, so nothing detached survives the join.
+    let previous = forwarders.lock().await.remove(&session_id);
+    if let Some(previous) = previous {
+        previous.abort();
+        let _ = previous.await;
+    }
+
     let session_for_log = session_id.clone();
     let task = tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    if event.cursor.seq <= baseline_seq {
-                        continue;
-                    }
-                    // Codex MUST-FIX-2: when the originating handler ran
-                    // on this same connection it already direct-sent the
-                    // wire frame; dropping the broadcast copy here is the
-                    // only way to keep delivery exactly-once. Other
-                    // connections still receive the event via fan-out.
-                    if event.from_connection == Some(self_connection_id) {
-                        continue;
-                    }
-                    if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
-                        continue;
-                    }
-                    if !ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref()) {
-                        continue;
-                    }
-                    // Stage 1 v2 is a wire projection of this existing
-                    // durable record. Do this before filtering so the v2
-                    // gate sees `EnvelopeV2`, while legacy/v1 connections
-                    // keep evaluating the original event byte-for-byte.
-                    let projected = features
-                        .projection_envelope_v2
-                        .then(|| project_v2_ledger_event(&ledger, &event.event, &event.cursor))
-                        .flatten();
-                    let event_for_wire = projected.unwrap_or(event.event);
-                    if !live_event_passes_capability_filter(&event_for_wire, features) {
-                        continue;
-                    }
-                    match send_ledger_event_durable(&ws, &ledger, event_for_wire) {
-                        Ok(()) => {}
-                        // #924 BLOCK 2: a closed writer OR a latched
-                        // failure both mean further pumps will produce
-                        // FatalClosed forever; stop spinning.
-                        Err(SendError::Closed | SendError::FatalClosed) => break,
-                        // BackpressureDrop: `send_ledger_event_durable`
-                        // already opportunistically emits replay_lossy; keep
-                        // pumping so a recovered consumer gets caught up.
-                        Err(_) => {}
+                    if matches!(
+                        forward_live_ledger_event(
+                            &ws,
+                            &ledger,
+                            event,
+                            baseline_seq,
+                            self_connection_id,
+                            features,
+                            topic_scope.as_deref(),
+                            profile_scope.as_deref(),
+                        )
+                        .await,
+                        // #924 BLOCK 2: a closed writer OR a latched failure
+                        // both mean further pumps produce FatalClosed
+                        // forever; stop spinning.
+                        Err(SendError::Closed | SendError::FatalClosed)
+                    ) {
+                        break;
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
-                    // Slow consumer fell behind. The ledger is durable; the
-                    // client's cursor is the source of truth and a follow-up
-                    // session/hydrate or reconnect with the last cursor
-                    // catches them up. Log and keep pumping new events.
-                    // This is the server-side gap detection point for v2:
-                    // the live projection stream skipped durable records and
-                    // the client must rehydrate from its cursor.
-                    if features.projection_envelope_v2 {
-                        metrics::counter!("octos_ui_protocol_v2_replay_gap_total").increment(1);
-                    }
-                    tracing::warn!(
-                        target: "octos::ui_protocol::ws",
-                        session_id = %session_for_log.0,
-                        skipped_events = skipped,
-                        "live ledger forwarder lagged; client must rehydrate via cursor"
-                    );
+                    log_live_forwarder_lag(&session_for_log, skipped, features);
                 }
                 Err(RecvError::Closed) => break,
             }
         }
     });
     // #924 NIT 8: store the full JoinHandle so the connection-cleanup
-    // path can `await` the aborted task before pruning idle
-    // subscribers. Replace any prior forwarder for this session on
-    // this connection — re-`session/open` restarts the live pump from
-    // a fresh baseline. The previous handle is aborted + the resulting
-    // JoinHandle dropped on the spot; we don't await here because
-    // re-open is a hot path.
-    let mut guard = forwarders.lock().await;
-    if let Some(prev) = guard.insert(session_id, task) {
-        prev.abort();
-    }
+    // path can `await` the aborted task before pruning idle subscribers.
+    // Any previous forwarder was retired ABOVE (and, on the open path,
+    // before the replay baseline), so this insert never displaces a live
+    // task.
+    forwarders.lock().await.insert(session_id, task);
 }
 
 /// Build the Stage-1 v2 projection for one already-durable source event.
@@ -17857,6 +17998,21 @@ fn live_event_passes_capability_filter(
     // routes call this filter.
     if !features.plan_todos {
         if let UiProtocolLedgerEvent::Notification(UiNotification::PlanUpdated(_)) = event {
+            return false;
+        }
+    }
+    // #2065 — goal-chip frames are gated on the SAME
+    // `coding.goal_runtime.v1` capability the goal RPC surface requires
+    // (`raw_method_feature_gate`). Every lane that can deliver a
+    // `session/goal/*` frame — session/open replay, the live pump, and the
+    // direct sends — funnels through this one filter, so a client that
+    // cannot call the goal surface has no chip to maintain and sees zero
+    // goal frames instead of ones it would report as unknown.
+    if !features.goal_runtime_available() {
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::SessionGoalUpdated(_) | UiNotification::SessionGoalCleared(_),
+        ) = event
+        {
             return false;
         }
     }
@@ -37165,27 +37321,67 @@ fn send_notification_lifecycle_forced_backpressure_fixture(
     Err(SendError::LifecycleFailure(reason.into()))
 }
 
-/// #1959 — per-session monotonic guard for goal chip events. Returns `false`
+/// #1959 process-global watermark map: SCOPED goal identity → highest
+/// goal-frame generation an admitted `SessionGoalUpdated` /
+/// `SessionGoalCleared` has recorded.
+///
+/// #2065 — the key is the SCOPED goal-store key resolved via
+/// [`goal_event_watermark_identity`], NOT the plain wire session id the
+/// frames carry. Two cwd scopes can share one wire session id
+/// (`appui.sessions_in_cwd`), and the guard is strictly monotonic per key:
+/// wire-keyed, one scope's later-ALLOCATED clear advanced the watermark
+/// past a sibling scope's earlier-built repaint, so that repaint was
+/// dropped at the guard and the sibling's live goal chip silently stopped
+/// updating. Per-scope identities keep the two streams independent, which
+/// is what the guard's monotonicity assumption requires.
+static GOAL_EVENT_GENERATION_GUARD: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn goal_event_guard_map() -> &'static StdMutex<HashMap<String, u64>> {
+    GOAL_EVENT_GENERATION_GUARD.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// #2065 — the #1959 watermark identity for a goal frame: the SCOPED
+/// goal-store key its generation was allocated under (registered
+/// atomically with the allocation by `next_goal_event_generation` — the
+/// producer's BUILD-TIME key, never a later re-resolution of the
+/// last-writer-wins cwd map, which a concurrent open flips). Falls back to
+/// the plain wire session id for unstamped/unregistered generations
+/// (legacy events, hand-built test frames, FIFO-evicted entries) — exactly
+/// the pre-fix behavior for exactly the events that predate the registry.
+///
+/// Takes the orchestrator STATE lock briefly; callers must resolve this
+/// BEFORE taking the guard-map lock (the two never nest).
+fn goal_event_watermark_identity(wire_session: &str, generation: u64) -> String {
+    default_agent_orchestrator()
+        .goal_event_watermark_key(generation)
+        .map(|key| key.0)
+        .unwrap_or_else(|| wire_session.to_owned())
+}
+
+/// #1959 — per-scope monotonic guard for goal chip events. Returns `false`
 /// (DROP) when a `SessionGoalUpdated` / `SessionGoalCleared` carries a
 /// `generation` that is not greater than the last goal event already emitted
-/// for the same wire session — so a stale update that races behind a clear can
-/// never be delivered after it (the client would otherwise resurrect the
+/// for the same SCOPED goal identity (S3; wire-session fallback for
+/// unregistered generations) — so a stale update that races behind a clear
+/// can never be delivered after it (the client would otherwise resurrect the
 /// cleared chip). Non-goal notifications and legacy `generation == 0` events
 /// (older backend, or events built before #1959) always pass. Both direct-send
 /// boundaries (`send_notification_durable` for the RPC-derived clear,
 /// `send_notification_ephemeral` for the interactive update) funnel through
 /// here, so ordering holds regardless of which path an event takes.
 fn goal_event_passes_generation_guard(notification: &UiNotification) -> bool {
-    // fn-local process-global: wire session id -> last emitted goal generation.
-    static GUARD: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
     let (session, generation) = match notification {
         UiNotification::SessionGoalUpdated(e) => (e.session_id.0.as_str(), e.generation),
         UiNotification::SessionGoalCleared(e) => (e.session_id.0.as_str(), e.generation),
         _ => return true,
     };
-    let map = GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    goal_event_generation_admits(&mut guard, session, generation)
+    // S3: resolve the scoped identity FIRST (orchestrator state lock,
+    // released) — then take the guard lock. The two never nest.
+    let identity = goal_event_watermark_identity(session, generation);
+    let mut guard = goal_event_guard_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    goal_event_generation_admits(&mut guard, &identity, generation)
 }
 
 /// Pure core of [`goal_event_passes_generation_guard`] (extracted for testing:
@@ -37365,6 +37561,44 @@ fn send_ledger_event_durable(
         None => return Err(SendError::BackpressureDrop),
     };
     match ws.send_durable(frame, &method) {
+        Ok(()) => {
+            record_ui_protocol_delivery_metric(delivery_metric);
+            if let Some(cursor) = cursor {
+                ws.metrics.record_durable_cursor(&cursor);
+            }
+            Ok(())
+        }
+        Err(SendError::BackpressureDrop) => {
+            if let Some(cursor) = cursor.as_ref() {
+                emit_replay_lossy_opportunistic(ws, ledger, &cursor.stream);
+            }
+            Err(SendError::BackpressureDrop)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Async twin of [`send_ledger_event_durable`] for the live-forwarder task
+/// (#2065): identical prep, metrics, and
+/// `replay_lossy` semantics — keep the two in lockstep — but the enqueue
+/// goes through [`WsConnection::send_durable_offloaded`], whose stdio lane
+/// parks THIS task cooperatively (non-blocking probe + async sleep) instead
+/// of a blocking `SyncSender::send` — never an executor-worker stall, and
+/// cancellable with an atomic enqueue so abort+join leaves nothing
+/// detached in flight.
+async fn send_ledger_event_durable_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    event: UiProtocolLedgerEvent,
+) -> Result<(), SendError> {
+    let method = ledger_event_method(&event).to_string();
+    let delivery_metric = ui_protocol_delivery_metric(&event);
+    let cursor = ledger_event_cursor(&event);
+    let frame = match frame_from_ledger(event) {
+        Some(frame) => frame,
+        None => return Err(SendError::BackpressureDrop),
+    };
+    match ws.send_durable_offloaded(frame, &method).await {
         Ok(()) => {
             record_ui_protocol_delivery_metric(delivery_metric);
             if let Some(cursor) = cursor {
