@@ -18922,7 +18922,7 @@ async fn ensure_session_profile_runtime(
         // store for profile 'x'" used to reach the TUI with its actual cause
         // (and its remedy) silently dropped.
         if octos_memory::is_episode_store_locked(&error) {
-            data_dir_locked_error(&profile_id, &error)
+            data_dir_locked_error(profile_id, &error)
         } else {
             runtime_unavailable_error(format!(
                 "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error:#}"
