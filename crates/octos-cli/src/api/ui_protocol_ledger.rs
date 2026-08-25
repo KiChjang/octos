@@ -851,7 +851,8 @@ impl UiProtocolLedger {
                 self.read_session_snapshot(storage_id, &session_dir),
                 Ok(Some(_))
             );
-        let snapshot = match self.read_session_disk_snapshot(storage_id, &session_dir, None) {
+        let snapshot = match self.read_session_disk_snapshot(storage_id, &session_dir, None, false)
+        {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(
@@ -1089,6 +1090,14 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         session_dir: &Path,
         replay_after_seq: Option<u64>,
+        // 8d-r1: `true` ONLY for the hydrate from_beginning-exempt caller
+        // (`read_disk_snapshot_for_replay`), whose seq-0 means "everything
+        // you still retain" (retained ring, shortcut valid). The
+        // session/open replay path passes `false`: its seq-0 has NO
+        // exemption and must full-scan the JSONL from seq 1 (the snapshot
+        // shortcut must NOT apply there). Distinguish by CALLER SEMANTICS,
+        // never by the bare seq value.
+        from_beginning_hydrate: bool,
     ) -> std::io::Result<Option<DiskSessionSnapshot>> {
         let mut log_files = match list_log_files(session_dir) {
             Ok(log_files) => log_files,
@@ -1149,15 +1158,19 @@ impl UiProtocolLedger {
                 // and never a shortcut seeded from corrupt data. The additive
                 // form `after + 1 >= oldest` avoids the underflow entirely.
                 let shortcut_ok = match replay_after_seq {
-                    // #8d: seq-0 (from-beginning) is answered by the
-                    // retained ring alone — treat it exactly like the
-                    // `None` arm below (the snapshot ring IS the retained
-                    // window), so a trimmed ring (oldest > 1) still takes
-                    // the shortcut instead of a full replay.
-                    Some(0) => snapshot_oldest.is_some_and(|oldest| oldest >= 1),
+                    // 8d-r1: seq-0 takes the shortcut ONLY on the hydrate
+                    // from_beginning-exempt path (caller flagged it). On
+                    // the session/open replay path (flag false) seq-0 has
+                    // no exemption → fall through to the full-scan rule
+                    // below, which requires after+1 >= oldest (so seq 0 →
+                    // 1 >= oldest, false for a trimmed ring → full JSONL
+                    // scan from seq 1, the pre-cfa8fb15 behaviour).
+                    Some(0) if from_beginning_hydrate => {
+                        snapshot_oldest.is_some_and(|oldest| oldest >= 1)
+                    }
                     Some(after) => snapshot_oldest
                         .is_some_and(|oldest| oldest >= 1 && after.saturating_add(1) >= oldest),
-                    // #8d: a from-beginning replay (`after: None` → seq 0)
+                    // 8d: a from-beginning replay (`after: None` → seq 0)
                     // is answered by the RETAINED RING alone (the hydrate
                     // path treats seq-0 as "everything you still retain",
                     // exempt from the oldest-cursor range check), NOT by a
@@ -2523,7 +2536,7 @@ impl UiProtocolLedger {
             .as_ref()?
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        match self.read_session_disk_snapshot(session_id, &session_dir, None) {
+        match self.read_session_disk_snapshot(session_id, &session_dir, None, false) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(
@@ -3031,7 +3044,7 @@ impl UiProtocolLedger {
         let session_dir = data_dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        match self.read_session_disk_snapshot(session_id, &session_dir, Some(after.seq)) {
+        match self.read_session_disk_snapshot(session_id, &session_dir, Some(after.seq), true) {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 warn!(
@@ -3159,7 +3172,7 @@ impl UiProtocolLedger {
         }
 
         let snapshot = self
-            .read_session_disk_snapshot(session_id, &session_dir, Some(after.seq))
+            .read_session_disk_snapshot(session_id, &session_dir, Some(after.seq), false)
             .map_err(|error| {
                 warn!(
                     target = "octos::ledger",
@@ -4485,7 +4498,7 @@ mod tests {
             .join(encode_session_dir_name(&session_id));
         let reference = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let snapshot = reference
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("read snapshot")
             .expect("snapshot exists");
         let mut reference_session = SessionLedger::new();
@@ -4716,7 +4729,7 @@ mod tests {
         // from the snapshot seed, not the full log.
         let ledger = UiProtocolLedger::with_config(config.clone());
         let snap = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("read ok")
             .expect("snapshot");
         assert_eq!(snap.head_seq, 5, "snapshot head 4 + log tail 5");
@@ -4730,7 +4743,7 @@ mod tests {
         // seq-0 (from-beginning via the replay path) also shortcuts.
         let ledger2 = UiProtocolLedger::with_config(config.clone());
         let snap0 = ledger2
-            .read_session_disk_snapshot(&session_id, &session_dir, Some(0))
+            .read_session_disk_snapshot(&session_id, &session_dir, Some(0), true)
             .expect("read ok")
             .expect("snapshot");
         assert_eq!(snap0.head_seq, 5, "seq-0 from-beginning also shortcuts");
@@ -4752,13 +4765,83 @@ mod tests {
         .expect("write corrupt snapshot");
         let ledger3 = UiProtocolLedger::with_config(config);
         let snap_bad = ledger3
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("read ok")
             .expect("snapshot");
         assert_eq!(
             snap_bad.head_seq, 5,
             "corrupt seq-0 snapshot must degrade to full replay"
         );
+    }
+
+    /// 8d-r1 ①/② — session/open {after:{seq:0}} on a TRIMMED snapshot
+    /// (oldest>1) with JSONL still holding seq 1: the snapshot shortcut
+    /// must NOT apply (session/open has no from_beginning exemption) →
+    /// full JSONL scan, replay from seq 1, no cursor_out_of_range.
+    /// Meanwhile session/hydrate from-beginning (read_disk_snapshot_for_
+    /// replay, seq-0 exempt) keeps the retained-window shortcut. And
+    /// replay_after_with_head(None) live-only semantics are unaffected.
+    #[test]
+    fn session_open_seq0_full_replays_but_hydrate_shortcuts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:8d-r1".into());
+        // ring=2, snapshot at seq 4 (covers seq 3..4; JSONL holds 1..5).
+        let mut config = snapshot_config(temp.path(), 2);
+        config.retained_per_session = 2;
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for i in 1..=5 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let raw: Value = serde_json::from_slice(
+            &fs::read(snapshot_file_path(temp.path(), &session_id)).expect("snapshot"),
+        )
+        .expect("json");
+        assert!(raw["entries"][0]["seq"].as_u64().expect("oldest") > 1);
+
+        // (a) session/open replay path: replay_after {seq:0} → full JSONL
+        // scan from seq 1 (shortcut OFF), no error.
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        let cursor0 = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger
+            .replay_after(&session_id, Some(&cursor0))
+            .expect("session/open seq-0 must not be cursor_out_of_range");
+        let seqs: Vec<u64> = replay.iter().map(|e| e.cursor.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5],
+            "session/open seq-0 must full-replay from seq 1"
+        );
+
+        // (b) hydrate from-beginning (read_disk_snapshot_for_replay) keeps
+        // the retained-window shortcut: same data dir, snapshot seeds the
+        // ring and the log scan skips ≤ snapshot head (only the tail 5 is
+        // replayed from disk).
+        let ledger2 = UiProtocolLedger::with_config(config.clone());
+        let (events, head) = ledger2
+            .snapshot_with_cursor(&session_id, None)
+            .expect("hydrate from-beginning");
+        assert_eq!(head.seq, 5);
+        // The hydrate projection comes from the snapshot-seeded ring + tail.
+        let hseqs: Vec<u64> = events.iter().map(|e| e.cursor.seq).collect();
+        assert_eq!(
+            hseqs,
+            vec![4, 5],
+            "hydrate keeps the retained window (snapshot seed 3,4 + tail 5, capped to 2)"
+        );
+
+        // (c) replay_after_with_head(None) live-only: unaffected — on an
+        // already-hydrated session it returns an empty replay paired with
+        // the current head (no full scan, no replayed history).
+        let (live_events, live_head) = ledger2
+            .replay_after_with_head(&session_id, None)
+            .expect("live-only after None");
+        assert!(live_events.is_empty(), "after=None is live-only, no replay");
+        assert_eq!(live_head, 5);
     }
 
     /// ymote P1 regression (PR #2114 review): ring=2, snapshot at seq 4 —
@@ -4799,7 +4882,7 @@ mod tests {
         // with replay_after_seq = Some(1).
         let ledger = UiProtocolLedger::with_config(config);
         let snap = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, Some(1))
+            .read_session_disk_snapshot(&session_id, &session_dir, Some(1), false)
             .expect("read ok")
             .expect("snapshot exists");
         let seqs: Vec<u64> = snap.replay_entries.iter().map(|e| e.cursor.seq).collect();
@@ -6192,7 +6275,7 @@ mod tests {
 
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let snapshot = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("scan ok");
         // An empty snapshot (`None`) is also acceptable (nothing
         // recovered); when present it must show zero recovered + one skip.
@@ -6291,7 +6374,7 @@ mod tests {
 
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let snapshot = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("scan ok")
             .expect("non-empty snapshot");
 
