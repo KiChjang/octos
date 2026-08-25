@@ -1149,9 +1149,25 @@ impl UiProtocolLedger {
                 // and never a shortcut seeded from corrupt data. The additive
                 // form `after + 1 >= oldest` avoids the underflow entirely.
                 let shortcut_ok = match replay_after_seq {
+                    // #8d: seq-0 (from-beginning) is answered by the
+                    // retained ring alone — treat it exactly like the
+                    // `None` arm below (the snapshot ring IS the retained
+                    // window), so a trimmed ring (oldest > 1) still takes
+                    // the shortcut instead of a full replay.
+                    Some(0) => snapshot_oldest.is_some_and(|oldest| oldest >= 1),
                     Some(after) => snapshot_oldest
                         .is_some_and(|oldest| oldest >= 1 && after.saturating_add(1) >= oldest),
-                    None => snapshot_oldest.is_some_and(|oldest| oldest == 1),
+                    // #8d: a from-beginning replay (`after: None` → seq 0)
+                    // is answered by the RETAINED RING alone (the hydrate
+                    // path treats seq-0 as "everything you still retain",
+                    // exempt from the oldest-cursor range check), NOT by a
+                    // full log replay. The snapshot ring IS that retained
+                    // window, so the shortcut applies whenever the snapshot
+                    // is non-empty and valid (oldest >= 1) — even when the
+                    // ring has since trimmed past seq 1 (oldest > 1). Only
+                    // a corrupt/empty snapshot (oldest == 0, caught by the
+                    // seq-0 hardening above) degrades to a full replay.
+                    None => snapshot_oldest.is_some_and(|oldest| oldest >= 1),
                 };
                 if shortcut_ok {
                     skip_through_seq = snapshot.head_seq;
@@ -4657,6 +4673,92 @@ mod tests {
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id))
             .join(SESSION_SNAPSHOT_FILE_NAME)
+    }
+
+    /// #8d — ring already trimmed (oldest > 1) + cold-start hydrate(None):
+    /// the snapshot shortcut MUST apply (no full replay) because
+    /// hydrate(None) is answered by the retained ring alone. And a corrupt
+    /// snapshot whose oldest entry is seq 0 MUST still degrade to a full
+    /// replay.
+    #[test]
+    fn snapshot_shortcut_applies_to_trimmed_ring_from_beginning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:8d-trimmed".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        // ring=2, snapshot_every=2 → snapshot at seq 4 covers seq 3..4
+        // (trimmed past seq 1: oldest=3 > 1).
+        let mut config = snapshot_config(temp.path(), 2);
+        config.retained_per_session = 2;
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for i in 1..=5 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let raw: Value = serde_json::from_slice(
+            &fs::read(snapshot_file_path(temp.path(), &session_id)).expect("snapshot"),
+        )
+        .expect("json");
+        assert_eq!(raw["head_seq"], 4);
+        let oldest_in_snap = raw["entries"][0]["seq"].as_u64().expect("oldest");
+        assert!(oldest_in_snap > 1, "ring must be trimmed (oldest > 1)");
+
+        // Cold-start hydrate(None): read_session_disk_snapshot with
+        // replay_after_seq=None — the shortcut must apply: the snapshot
+        // seeds the ring and the log scan skips everything ≤ snapshot
+        // head (4), replaying only the tail (seq 5). head_seq reflects
+        // snapshot+tail (5), retained ring = snapshot(3,4)+tail(5) capped
+        // to 2 → (4,5). This is the O(snapshot+tail) path, NOT a full
+        // O(all-events) replay — verified by the retained ring coming
+        // from the snapshot seed, not the full log.
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        let snap = ledger
+            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .expect("read ok")
+            .expect("snapshot");
+        assert_eq!(snap.head_seq, 5, "snapshot head 4 + log tail 5");
+        let ring_seqs: Vec<u64> = snap.retained_entries.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            ring_seqs,
+            vec![4, 5],
+            "retained ring = snapshot seed (3,4) + tail (5), capped to 2"
+        );
+
+        // seq-0 (from-beginning via the replay path) also shortcuts.
+        let ledger2 = UiProtocolLedger::with_config(config.clone());
+        let snap0 = ledger2
+            .read_session_disk_snapshot(&session_id, &session_dir, Some(0))
+            .expect("read ok")
+            .expect("snapshot");
+        assert_eq!(snap0.head_seq, 5, "seq-0 from-beginning also shortcuts");
+
+        // Corrupt: a snapshot whose oldest entry is seq 0 MUST degrade to
+        // a full replay (log head 5).
+        let bad = json!({
+            "version": SESSION_SNAPSHOT_VERSION,
+            "head_seq": 4,
+            "entries": [
+                {"v": 1, "seq": 0, "event": raw["entries"][0]["event"]},
+                {"v": 1, "seq": 4, "event": raw["entries"][1]["event"]},
+            ],
+        });
+        fs::write(
+            snapshot_file_path(temp.path(), &session_id),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .expect("write corrupt snapshot");
+        let ledger3 = UiProtocolLedger::with_config(config);
+        let snap_bad = ledger3
+            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .expect("read ok")
+            .expect("snapshot");
+        assert_eq!(
+            snap_bad.head_seq, 5,
+            "corrupt seq-0 snapshot must degrade to full replay"
+        );
     }
 
     /// ymote P1 regression (PR #2114 review): ring=2, snapshot at seq 4 —
