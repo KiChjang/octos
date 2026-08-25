@@ -35409,77 +35409,135 @@ fn preview_oversized_frame(text: String) -> String {
         return text;
     };
 
-    // Paths already rewritten by string truncation; skipped on later passes so
-    // each string is previewed at most once (idempotence by PATH, not by
-    // sniffing field content — see `largest_truncatable_string`).
-    let mut previewed_string_paths: HashSet<Vec<PathSeg>> = HashSet::new();
+    // Single-pass design (黑板第 2 条 2c, replacing the O(payload × rounds)
+    // truncate-one/re-serialize loop that cost ~10s on multi-MB hydrate
+    // replies):
+    //   1. measure the serialized length ONCE;
+    //   2. one walk collects every truncatable string (path, escaped len,
+    //      raw len), sorted largest-first;
+    //   3. compute each field's escaped budget against a running overhead
+    //      (current length minus everything already truncated), preview it
+    //      head+tail WITHOUT re-serializing, and subtract the savings —
+    //      until the running estimate fits the target;
+    //   4. serialize ONCE to verify; if the estimate was optimistic (rare:
+    //      escape-factor drift), run ONE structural fallback round
+    //      (array-shrink loop) — so the whole function performs at most 2
+    //      full serializations.
+    let initial_len = match serde_json::to_string(&value) {
+        Ok(s) => s.len(),
+        Err(_) => return text,
+    };
+    if initial_len <= TRUNCATED_FRAME_TARGET_BYTES {
+        return serde_json::to_string(&value).unwrap_or(text);
+    }
 
-    // Iterate: truncate the largest string field, re-measure, repeat; when no
-    // string can be shrunk further, drop elements from the largest array. The
-    // bound is (number of string fields) + (total array elements), each pass
-    // either previews one string path or removes >= 1 array element, so this
-    // terminates.
-    loop {
-        let serialized_len = match serde_json::to_string(&value) {
-            Ok(s) => s.len(),
-            // Re-serialization cannot realistically fail for a Value parsed
-            // from text, but if it ever did, fall back to the original.
-            Err(_) => return text,
+    // Pass 1: collect all truncatable strings, largest first.
+    let mut candidates: Vec<(Vec<PathSeg>, usize, usize)> = Vec::new();
+    let mut path: Vec<PathSeg> = Vec::new();
+    collect_truncatable_strings(&value, &mut path, &mut candidates);
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+
+    let mut running_len = initial_len;
+    for (path, field_escaped_len, field_raw_len) in &candidates {
+        if running_len <= TRUNCATED_FRAME_TARGET_BYTES {
+            break;
+        }
+        // Overhead = current frame minus this field's escaped contribution
+        // (escaped bytes + two surrounding quote bytes).
+        let overhead = running_len.saturating_sub(field_escaped_len + 2);
+        let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
+            .saturating_sub(overhead)
+            .saturating_sub(2);
+        let preview = match build_head_tail_preview(
+            field_at_path(&value, path)
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            *field_raw_len,
+            field_escaped_budget,
+        ) {
+            Some(preview) => preview,
+            None => UNPREVIEWABLE_STUB.to_owned(),
         };
-        if serialized_len <= TRUNCATED_FRAME_TARGET_BYTES {
-            // Provably under target (< MAX_TEXT_FRAME_BYTES). Emit the rewrite
-            // if we changed anything; otherwise the original under-cap text.
+        // Running estimate: new field escaped length is at most the budget
+        // we handed out (marker reserve included); estimate conservatively
+        // with the actual preview's escaped length instead — one cheap
+        // scan, no serialization.
+        let new_escaped = json_escaped_len_bytes(preview.as_bytes());
+        if !set_field_at_path(&mut value, path, Value::String(preview)) {
+            return text;
+        }
+        running_len = overhead + 2 + new_escaped;
+    }
+
+    // Structural fallback: strings alone could not fit (or did, and this
+    // verifies it). Serialize ONCE to verify the estimate.
+    let mut serialized = match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(_) => return text,
+    };
+    if serialized.len() <= TRUNCATED_FRAME_TARGET_BYTES {
+        return serialized;
+    }
+
+    // Still over target -> structural case (many huge sibling strings each
+    // stubbed, or giant non-string payload). Fall back to the array-shrink
+    // loop, reusing the original helpers. Bounded: each round removes >= 1
+    // element and there are finitely many.
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        debug_assert!(
+            rounds <= 64,
+            "preview_oversized_frame structural fallback exceeded round bound"
+        );
+        if rounds > 64 {
+            return serialized;
+        }
+        if !shrink_largest_array(&mut value) {
             return serde_json::to_string(&value).unwrap_or(text);
         }
+        serialized = match serde_json::to_string(&value) {
+            Ok(s) => s,
+            Err(_) => return text,
+        };
+        if serialized.len() <= TRUNCATED_FRAME_TARGET_BYTES {
+            return serialized;
+        }
+    }
+}
 
-        // Find the largest not-yet-previewed string field.
-        if let Some((path, field_escaped_len, field_raw_len)) =
-            largest_truncatable_string(&value, &previewed_string_paths)
-        {
-            // Frame overhead = serialized frame minus this field's escaped
-            // contribution (escaped bytes + the two surrounding quote bytes).
-            // The new frame length is `overhead + 2 + new_field_escaped_len`,
-            // so to hit the target the field's escaped budget is:
-            //     budget = TARGET - overhead - 2
-            let overhead = serialized_len.saturating_sub(field_escaped_len + 2);
-            let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
-                .saturating_sub(overhead)
-                .saturating_sub(2);
-
-            let preview = match build_head_tail_preview(
-                field_at_path(&value, &path)
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                field_raw_len,
-                field_escaped_budget,
-            ) {
-                Some(preview) => preview,
-                // Even an empty preview can't fit the budget (overhead alone
-                // exceeds target — only possible with many huge sibling
-                // fields, which the iteration handles, or a pathological
-                // envelope). Mark this field as a minimal stub and continue.
-                None => UNPREVIEWABLE_STUB.to_owned(),
-            };
-            if !set_field_at_path(&mut value, &path, Value::String(preview)) {
-                // Path vanished (should not happen) -> bail to original.
-                return text;
+/// Single-walk collection of every truncatable string field: same
+/// eligibility rules as `collect_truncatable_strings` (large enough to be
+/// worth truncating, not already carrying the full truncation-marker
+/// sentinel) but gathers ALL candidates (path, escaped len, raw len) in
+/// one pass instead of re-walking per truncation round.
+fn collect_truncatable_strings(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    out: &mut Vec<(Vec<PathSeg>, usize, usize)>,
+) {
+    match value {
+        Value::String(s) => {
+            let escaped = json_escaped_len_bytes(s.as_bytes());
+            if escaped > MARKER_ESCAPED_RESERVE_BYTES && !contains_full_truncation_marker(s) {
+                out.push((path.clone(), escaped, s.len()));
             }
-            // Record the path so this string is not re-selected next pass.
-            previewed_string_paths.insert(path);
-            continue;
         }
-
-        // No string field can be further truncated, but we are still over
-        // target -> STRUCTURAL case. Drop middle/trailing elements from the
-        // largest array (keeping valid JSON) and re-measure.
-        if shrink_largest_array(&mut value) {
-            continue;
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(idx));
+                collect_truncatable_strings(item, path, out);
+                path.pop();
+            }
         }
-
-        // Nothing left to shrink (no truncatable string, no shrinkable array)
-        // -> pathological. Return the best-effort body unchanged; the caller
-        // observes it is still over cap and drops it (returns `None`).
-        return serde_json::to_string(&value).unwrap_or(text);
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(PathSeg::Key(key.clone()));
+                collect_truncatable_strings(item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -35702,87 +35760,10 @@ enum PathSeg {
     Index(usize),
 }
 
-/// Find the largest truncatable string field by JSON-escaped length, returning
-/// its path, escaped length, and raw byte length. A string is "truncatable"
-/// only if shrinking it could meaningfully reduce the frame — we skip strings
-/// that are already shorter than a marker would be (no gain) and any field PATH
-/// already previewed on a prior pass (idempotence by path, recorded in
-/// `previewed_paths` by the caller — NOT by sniffing field content, so a
-/// legitimate >1 MiB payload that merely contains a phrase like "bytes
-/// truncated" is still truncated rather than wrongly skipped).
-fn largest_truncatable_string(
-    value: &Value,
-    previewed_paths: &HashSet<Vec<PathSeg>>,
-) -> Option<(Vec<PathSeg>, usize, usize)> {
-    let mut best: Option<(Vec<PathSeg>, usize, usize)> = None;
-    let mut path: Vec<PathSeg> = Vec::new();
-    walk_for_largest_string(value, &mut path, previewed_paths, &mut best);
-    best
-}
-
-fn walk_for_largest_string(
-    value: &Value,
-    path: &mut Vec<PathSeg>,
-    previewed_paths: &HashSet<Vec<PathSeg>>,
-    best: &mut Option<(Vec<PathSeg>, usize, usize)>,
-) {
-    match value {
-        Value::String(s) => {
-            // Only consider strings large enough that truncating them yields a
-            // net reduction (must exceed the marker reserve + a small head/tail
-            // floor, else there is no point), and that we have not already
-            // previewed on a prior pass.
-            //
-            // Idempotence is primarily by PATH (`previewed_paths`). The
-            // secondary guard below — "this string ALREADY carries the exact
-            // full truncation-marker sentinel" — is belt-and-suspenders for the
-            // one case the path set can't track: array shrinking (later in the
-            // outer loop) removes elements, so surviving elements' index-paths
-            // SHIFT and the recorded paths go stale. A re-truncated already-
-            // previewed string can't reopen the over-cap bug (a head+tail
-            // preview is no longer the largest, so it isn't re-selected), but
-            // matching the precise sentinel keeps the "each semantic string
-            // truncated once" invariant clean regardless of index drift. We
-            // match the FULL marker scaffold (`\n…… [<N> bytes truncated] ……\n`),
-            // NOT the bare phrase `bytes truncated`, so a payload that merely
-            // contains that phrase is still truncated (see
-            // `payload_containing_marker_phrase_is_still_truncated`).
-            let escaped = json_escaped_len_bytes(s.as_bytes());
-            if escaped > MARKER_ESCAPED_RESERVE_BYTES + 32
-                && !previewed_paths.contains(path)
-                && !contains_full_truncation_marker(s)
-            {
-                let is_better = match best {
-                    Some((_, best_escaped, _)) => escaped > *best_escaped,
-                    None => true,
-                };
-                if is_better {
-                    *best = Some((path.clone(), escaped, s.len()));
-                }
-            }
-        }
-        Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                path.push(PathSeg::Index(idx));
-                walk_for_largest_string(item, path, previewed_paths, best);
-                path.pop();
-            }
-        }
-        Value::Object(map) => {
-            for (key, item) in map {
-                path.push(PathSeg::Key(key.clone()));
-                walk_for_largest_string(item, path, previewed_paths, best);
-                path.pop();
-            }
-        }
-        _ => {}
-    }
-}
-
 /// True iff `s` already contains the EXACT full head+tail truncation-marker
 /// scaffold produced by [`build_head_tail_preview`]:
 /// `\n…… [<N> bytes truncated] ……\n` (N a decimal byte count). Used as a
-/// secondary "already previewed" guard in [`walk_for_largest_string`] that is
+/// secondary "already previewed" guard in [`collect_truncatable_strings`] that is
 /// robust to array-shrink index drift (path-set staleness).
 ///
 /// This matches the COMPLETE scaffold — the leading `\n…… [` prefix and the
