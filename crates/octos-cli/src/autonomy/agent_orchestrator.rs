@@ -12663,10 +12663,7 @@ fn enqueue_agent_terminal_continuations(
     // check skips re-observation, restart-safe); a genuinely re-expanded
     // group gets a new epoch at spawn admission and joins again.
     let join_group_key = agent_continuation_group_id(agent);
-    let join_state = state
-        .scatter_join_state
-        .entry(join_group_key)
-        .or_default();
+    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
     let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
     let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
@@ -12706,10 +12703,7 @@ fn enqueue_agent_terminal_continuations(
     };
     enqueue_and_persist_continuation(state, scatter);
     let join_group_key = agent_continuation_group_id(agent);
-    let join_state = state
-        .scatter_join_state
-        .entry(join_group_key)
-        .or_default();
+    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
     join_state.last_joined_key = Some(join_key);
 }
 

@@ -35503,6 +35503,9 @@ async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
         &questions,
         &forwarders,
         None,
+        // #2067 — the open-path delivery filter pin; no connection-level pin
+        // in this test, so filtering is per-profile-scope only.
+        None,
         features,
         "open-no-goal-runtime".into(),
         SessionOpenParams {
@@ -35570,6 +35573,7 @@ async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
         ws.connection_id(),
         ConnectionUiFeatures::stdio_defaults(),
         None,
+        None,
         first_rx,
         forwarders.clone(),
     )
@@ -35584,6 +35588,7 @@ async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
         0,
         ws.connection_id(),
         ConnectionUiFeatures::stdio_defaults(),
+        None,
         None,
         second_rx,
         forwarders.clone(),
@@ -35643,6 +35648,7 @@ async fn session_open_goal_stdio_lane_retire_leaves_no_inflight_send() {
         0,
         ws.connection_id(),
         ConnectionUiFeatures::stdio_defaults(),
+        None,
         None,
         live_rx,
         forwarders.clone(),

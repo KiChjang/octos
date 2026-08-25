@@ -17516,6 +17516,7 @@ async fn forward_live_ledger_event(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<&str>,
+    profile_scope: Option<&str>,
 ) -> Result<(), SendError> {
     if event.cursor.seq <= baseline_seq {
         return Ok(());
@@ -17526,7 +17527,11 @@ async fn forward_live_ledger_event(
     if !ledger_event_matches_topic_scope(&event.event, topic_scope) {
         return Ok(());
     }
-    if !ledger_event_matches_profile_scope(&event.event, &ws.snapshot_live_profile_id()) {
+    // #2067 (H2) — the profile scope is captured at session/open, never
+    // re-read from the connection: a later `session/open` on the same
+    // connection can resolve a different profile, and the shared cell would
+    // retarget this pump mid-flight.
+    if !ledger_event_matches_profile_scope(&event.event, profile_scope) {
         return Ok(());
     }
     let projected = features
@@ -17590,6 +17595,7 @@ async fn spawn_live_forwarder(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<String>,
+    profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
 ) {
@@ -17638,6 +17644,7 @@ async fn spawn_live_forwarder(
                             self_connection_id,
                             features,
                             topic_scope.as_deref(),
+                            profile_scope.as_deref(),
                         )
                         .await,
                         // #924 BLOCK 2: a closed writer OR a latched failure
@@ -18117,7 +18124,6 @@ struct SessionOpenOutcome {
     /// or `None` when its scope is not a tenant boundary and filtering it
     /// would starve it. See `connection_filterable_profile_scope`.
     profile_scope: Option<String>,
-    profile_id: String,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -18466,7 +18472,6 @@ async fn open_session_result(
         opened_event,
         replay_baseline_seq,
         profile_scope,
-        profile_id: ledger_profile_id,
     })
 }
 
