@@ -14,7 +14,8 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle, resolve_workspace_file_handle,
 };
-#[cfg(test)]
+// `Message` is used by non-test lib code (`dedupe_history_rows` below),
+// so this import must not be test-gated.
 use octos_core::Message;
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
