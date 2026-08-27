@@ -1866,7 +1866,12 @@ impl AdaptiveRouter {
         Some(matched)
     }
 
-    /// Select provider index and whether this is a probe request.
+    /// The DETERMINISTIC selection — everything `select_provider` does
+    /// except the stochastic probe redirect (#2135 round-7 P1: the
+    /// identity/readiness accessors need the same mode/lane rules and the
+    /// same ASCENDING score order as real routing, not a parallel
+    /// reimplementation; an earlier cut used max_by against a
+    /// lower-is-better score and preferred the worst lane).
     ///
     /// - Off / Hedge: priority order, skip circuit-broken only.
     ///   (Hedge mode uses this to pick the primary for racing.)
@@ -1877,7 +1882,7 @@ impl AdaptiveRouter {
     /// in the lane's candidate list. When the lane filter yields
     /// zero matches we fall through to the full slot list so the
     /// router never starves (see [`Self::lane_filtered_slot_indices`]).
-    fn select_provider(&self) -> (usize, bool) {
+    fn select_provider_deterministic(&self) -> usize {
         let mode = self.mode();
         // RFC-3: lane-filtered eligible set, if any. None ⇒ no
         // filter; behave identically to pre-RFC-3.
@@ -1907,7 +1912,7 @@ impl AdaptiveRouter {
                                 "provider failover (lane filter, lane changing disabled)"
                             );
                         }
-                        return (i, false);
+                        return i;
                     }
                 }
                 // All lane candidates circuit-broken → fall through
@@ -1927,7 +1932,7 @@ impl AdaptiveRouter {
                             "provider failover (circuit breaker, lane changing disabled)"
                         );
                     }
-                    return (i, false);
+                    return i;
                 }
             }
             // All circuit-broken — fall through to least-failed logic below
@@ -1980,19 +1985,42 @@ impl AdaptiveRouter {
                 "all providers circuit-broken, using least-failed"
             );
             self.last_selected.store(best as u32, Ordering::Relaxed);
-            return (best, false);
+            return best;
         }
 
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let best_idx = scored[0].0;
 
+        // Detect lane change. (This now runs before any probe redirect in
+        // `select_provider` — a probe is a measurement detour, not a lane
+        // change, so logging the deterministic selection is the accurate
+        // record.)
+        let prev = self.last_selected.swap(best_idx as u32, Ordering::Relaxed);
+        if prev != best_idx as u32 && prev < self.slots.len() as u32 {
+            info!(
+                from = self.slots[prev as usize].provider.provider_name(),
+                to = self.slots[best_idx].provider.provider_name(),
+                from_score = format!("{:.3}", self.score(&self.slots[prev as usize])),
+                to_score = format!("{:.3}", self.score(&self.slots[best_idx])),
+                "adaptive lane change"
+            );
+        }
+
+        best_idx
+    }
+
+    /// Select provider index and whether this is a probe request: the
+    /// deterministic selection above, plus the stochastic stale-provider
+    /// probe redirect used for actual request routing only.
+    fn select_provider(&self) -> (usize, bool) {
+        let best_idx = self.select_provider_deterministic();
         // Probe: with some probability, redirect to a stale non-primary provider.
         // RFC-3 (#1292) — codex P2: when a lane filter is active,
         // restrict probe targets to the lane's eligible slots so a
         // probe under `slides:*`/`code:*` can never route the user
         // turn to an out-of-lane model.
         if self.slots.len() > 1 && self.should_probe() {
-            // Find a stale provider that isn't the best
+            let lane_eligible = self.lane_filtered_slot_indices();
             for (i, slot) in self.slots.iter().enumerate() {
                 if i != best_idx
                     && slot.metrics.is_stale(self.config.probe_interval_secs)
@@ -2011,19 +2039,6 @@ impl AdaptiveRouter {
                 }
             }
         }
-
-        // Detect lane change
-        let prev = self.last_selected.swap(best_idx as u32, Ordering::Relaxed);
-        if prev != best_idx as u32 && prev < self.slots.len() as u32 {
-            info!(
-                from = self.slots[prev as usize].provider.provider_name(),
-                to = self.slots[best_idx].provider.provider_name(),
-                from_score = format!("{:.3}", self.score(&self.slots[prev as usize])),
-                to_score = format!("{:.3}", self.score(&self.slots[best_idx])),
-                "adaptive lane change"
-            );
-        }
-
         (best_idx, false)
     }
 
@@ -2166,6 +2181,20 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        // #2135 round-8 P1: every adaptive dispatch — primary selection,
+        // stochastic probe, hedge racer, failover candidate — funnels
+        // through here, so this is the ONE place the route-fit guard
+        // covers them all. An unfit route errors WITHOUT touching the
+        // slot's metrics (not the provider's fault; the circuit breaker
+        // must not open over prompt size) — failover treats it like any
+        // other error and moves to a lane that fits.
+        if !crate::context::route_fits_request(&self.slots[idx].provider, messages, tools).await {
+            return Err(eyre::eyre!(
+                "route {} skipped: request does not fit its context window ({} tokens)",
+                self.slots[idx].provider.provider_name(),
+                self.slots[idx].provider.context_window()
+            ));
+        }
         let start = Instant::now();
         let result = self.slots[idx].provider.chat(messages, tools, config).await;
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -2247,6 +2276,20 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        // #2135 round-8 P1: every adaptive dispatch — primary selection,
+        // stochastic probe, hedge racer, failover candidate — funnels
+        // through here, so this is the ONE place the route-fit guard
+        // covers them all. An unfit route errors WITHOUT touching the
+        // slot's metrics (not the provider's fault; the circuit breaker
+        // must not open over prompt size) — failover treats it like any
+        // other error and moves to a lane that fits.
+        if !crate::context::route_fits_request(&self.slots[idx].provider, messages, tools).await {
+            return Err(eyre::eyre!(
+                "route {} skipped: request does not fit its context window ({} tokens)",
+                self.slots[idx].provider.provider_name(),
+                self.slots[idx].provider.context_window()
+            ));
+        }
         let start = Instant::now();
         let result = self.slots[idx]
             .provider
@@ -2459,19 +2502,54 @@ impl LlmProvider for AdaptiveRouter {
         }
     }
 
+    // #2135 round-6 P1: the sizing accessors take the MINIMUM across all
+    // slots — selection-INDEPENDENT and safe for every route this router
+    // can take (Lane-mode stochastic probes, hedged sends, failover): a
+    // prompt sized for a probed 256K local primary must not reach a 32K
+    // lane. Per-route resizing at dispatch is the precise fix and belongs
+    // to the router itself; until then the conservative envelope is the
+    // pre-probe catalog behavior restored, minus its staleness.
+    fn context_window(&self) -> u32 {
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.context_window())
+            .min()
+            .unwrap_or(32_768)
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.max_output_tokens())
+            .min()
+            .unwrap_or(4096)
+    }
+
+    async fn ensure_ready(&self) {
+        // Readiness preps the lane the router would DETERMINISTICALLY
+        // prefer (best score, no stochastic exploration — #2135 round-6
+        // P1): readiness may preload, and a coin-flipped lane must not
+        // decide which model gets loaded into memory.
+        let idx = self.select_provider_deterministic();
+        self.slots[idx].provider.ensure_ready().await;
+    }
+
     fn model_id(&self) -> &str {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.model_id()
+        self.slots[self.select_provider_deterministic()]
+            .provider
+            .model_id()
     }
 
     fn provider_name(&self) -> &str {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.provider_name()
+        self.slots[self.select_provider_deterministic()]
+            .provider
+            .provider_name()
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.provider_metadata()
+        self.slots[self.select_provider_deterministic()]
+            .provider
+            .provider_metadata()
     }
 
     fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {

@@ -1205,6 +1205,13 @@ impl Agent {
                     // tier 3 considers whether to summarise).
                     let protected_ids = collect_protected_tool_call_ids(&messages);
                     self.run_tier1_compaction(&mut messages, &protected_ids, tier1_pass(iteration));
+                    // #2135 review P1: a provider that learns its true
+                    // context window asynchronously (the local probe) must
+                    // resolve BEFORE the trim below reads context_window() —
+                    // otherwise a resumed long transcript is compacted
+                    // against the stale catalog value. No-op (immediate) for
+                    // every other provider and once resolved.
+                    self.llm.ensure_ready().await;
                     prepare_conversation_messages(self, &mut messages, &mut turn);
                     // Harness M6.3: post-prep compaction pass so the declarative
                     // runner sees the final shape of the conversation (after
@@ -2208,6 +2215,10 @@ impl Agent {
                 // benefit from the same cheap shrinkage before their LLM call.
                 let protected_ids = collect_protected_tool_call_ids(&messages);
                 self.run_tier1_compaction(&mut messages, &protected_ids, tier1_pass(iteration));
+                // #2135 re-review P1: task mode (delegated workers, MCP task
+                // runs) sizes its prompt here too — resolve a lazily-probed
+                // window before the trim reads context_window().
+                self.llm.ensure_ready().await;
                 prepare_task_messages(self, &mut messages, &mut turn);
                 self.prepare_prompt_with_context_manager(
                     &mut messages,
